@@ -1,0 +1,25 @@
+# OS/editor noise
+.DS_Store
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+.venv/
+
+# Build and test artifacts
+bin/
+dist/
+*.test
+coverage.out
+
+# Local agent/runtime state, not product source
+AGENTS.md
+.agents/
+.codex/
+.omx/
+.omcodex.lock.json
+.omcodexrc.json
+omcustom/
+guides/
+tests/
