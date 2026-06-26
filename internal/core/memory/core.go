@@ -29,17 +29,20 @@ type Embedder interface {
 // All methods are tenant-scoped to preserve isolation guarantees.
 // VectorStore methods are called while Core.mu is held; the in-memory default
 // therefore requires no additional synchronisation of its own.
+//
+// The Chunk type is exported so that external packages can implement VectorStore
+// without embedding unexported memory-package types.
 type VectorStore interface {
 	// Add appends chunks for a tenant (called during Ingest).
-	Add(tenantID brainapi.TenantID, chunks []chunk)
+	Add(tenantID brainapi.TenantID, chunks []Chunk)
 	// Search returns the top-limit ranked chunks matching the pre-embedded query.
-	Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []chunk
+	Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []Chunk
 	// Len returns the current chunk count for a tenant (used before Ingest for rollback).
 	Len(tenantID brainapi.TenantID) int
 	// TruncateTo removes chunks beyond n for a tenant (Ingest rollback on persist failure).
 	TruncateTo(tenantID brainapi.TenantID, n int)
 	// Replace overwrites all chunks for a tenant (used during snapshot load).
-	Replace(tenantID brainapi.TenantID, chunks []chunk)
+	Replace(tenantID brainapi.TenantID, chunks []Chunk)
 }
 
 // SynthesisInput is a single retrieved passage passed to a Synthesizer.
@@ -70,6 +73,38 @@ type Reranker interface {
 	Rerank(question string, candidateTexts []string) []int
 }
 
+// ─── Exported vector record ──────────────────────────────────────────────────
+
+// Chunk is the unit of indexed content returned by VectorStore.Search and
+// passed to VectorStore.Add. It is exported so external VectorStore
+// implementations (e.g. Qdrant, PostgreSQL pgvector) can satisfy the interface
+// without depending on unexported memory-package internals.
+//
+// Field semantics mirror the former unexported chunk type; all behaviour of the
+// in-memory default implementation is byte-for-byte identical after the rename.
+type Chunk struct {
+	// ID is the deterministic identifier assigned during chunksFrom:
+	// format "{tenantID}:chunk:{position}".
+	ID string
+	// Source is the origin document metadata, including the TenantID that owns
+	// this chunk. External VectorStore implementations must populate this on
+	// Search so that QueryResponse.Sources is correctly populated.
+	Source brainapi.Source
+	// Text is the raw text of the chunk, used by the Reranker and Synthesizer.
+	Text string
+	// Terms is the BM25 term-frequency map for this chunk, computed from Text.
+	// In-memory scoring uses Terms for overlap calculation; external stores may
+	// ignore it for retrieval but should populate it from stored payload on
+	// Search so that the local Reranker can re-score candidates.
+	Terms map[string]int
+	// Vector is the embedding of Text produced by the configured Embedder.
+	Vector []float64
+	// FreshAt is the ingest timestamp.
+	FreshAt time.Time
+	// Kind is the MIME type of the source document.
+	Kind string
+}
+
 // ─── Default (local) implementations ────────────────────────────────────────
 
 // localEmbedder is the default Embedder. It uses the deterministic FNV-1a
@@ -84,18 +119,25 @@ func (localEmbedder) Embed(text string) []float64 {
 // inMemoryVectorStore is the default VectorStore. It reproduces the original
 // ranking formula exactly: score = overlap(terms)*2 + cosine(vectors), top-N.
 type inMemoryVectorStore struct {
-	chunks map[brainapi.TenantID][]chunk
+	chunks map[brainapi.TenantID][]Chunk
 }
 
 func newInMemoryVectorStore() *inMemoryVectorStore {
-	return &inMemoryVectorStore{chunks: make(map[brainapi.TenantID][]chunk)}
+	return &inMemoryVectorStore{chunks: make(map[brainapi.TenantID][]Chunk)}
 }
 
-func (s *inMemoryVectorStore) Add(tenantID brainapi.TenantID, chunks []chunk) {
+// NewInMemoryVectorStore returns a fresh, empty in-memory VectorStore.
+// It is exported so external test packages can run the VectorStore contract
+// suite against the default implementation alongside their own backends.
+func NewInMemoryVectorStore() VectorStore {
+	return newInMemoryVectorStore()
+}
+
+func (s *inMemoryVectorStore) Add(tenantID brainapi.TenantID, chunks []Chunk) {
 	s.chunks[tenantID] = append(s.chunks[tenantID], chunks...)
 }
 
-func (s *inMemoryVectorStore) Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []chunk {
+func (s *inMemoryVectorStore) Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []Chunk {
 	return topChunks(rankChunks(questionTerms, questionVector, s.chunks[tenantID]), limit)
 }
 
@@ -109,8 +151,8 @@ func (s *inMemoryVectorStore) TruncateTo(tenantID brainapi.TenantID, n int) {
 	}
 }
 
-func (s *inMemoryVectorStore) Replace(tenantID brainapi.TenantID, chunks []chunk) {
-	dst := make([]chunk, len(chunks))
+func (s *inMemoryVectorStore) Replace(tenantID brainapi.TenantID, chunks []Chunk) {
+	dst := make([]Chunk, len(chunks))
 	copy(dst, chunks)
 	s.chunks[tenantID] = dst
 }
@@ -202,18 +244,8 @@ type document struct {
 	freshAt time.Time
 }
 
-type chunk struct {
-	id      string
-	source  brainapi.Source
-	text    string
-	terms   map[string]int
-	vector  []float64
-	freshAt time.Time
-	kind    string
-}
-
 type scoredChunk struct {
-	chunk chunk
+	chunk Chunk
 	score float64
 	order int
 }
@@ -520,13 +552,13 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	// Rerank the candidates.
 	candidateTexts := make([]string, len(candidates))
 	for i, ch := range candidates {
-		candidateTexts[i] = ch.text
+		candidateTexts[i] = ch.Text
 	}
 	ranked := c.reranker.Rerank(question, candidateTexts)
 
 	// Select top-N from the reranked indices, skipping out-of-range values
 	// that a custom Reranker implementation might return.
-	top := make([]chunk, 0, c.topN)
+	top := make([]Chunk, 0, c.topN)
 	for _, idx := range ranked {
 		if len(top) >= c.topN {
 			break
@@ -540,7 +572,7 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	// Synthesize the grounded answer.
 	inputs := make([]SynthesisInput, len(top))
 	for i, ch := range top {
-		inputs[i] = SynthesisInput{Text: ch.text}
+		inputs[i] = SynthesisInput{Text: ch.Text}
 	}
 	synthesis, err := c.synthesizer.Synthesize(ctx, question, inputs)
 	if err != nil {
@@ -644,13 +676,13 @@ func documentFrom(req brainapi.IngestRequest, freshAt time.Time) document {
 // chunksFrom splits doc content into fixed-width word chunks and embeds each
 // using emb. The Embedder is threaded in so callers can swap the embedding
 // strategy without touching this function.
-func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offset int, emb Embedder) []chunk {
+func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offset int, emb Embedder) []Chunk {
 	words := strings.Fields(doc.content)
 	if len(words) == 0 {
 		words = []string{doc.title}
 	}
 	const chunkWords = 48
-	chunks := make([]chunk, 0, (len(words)+chunkWords-1)/chunkWords)
+	chunks := make([]Chunk, 0, (len(words)+chunkWords-1)/chunkWords)
 	for start := 0; start < len(words); start += chunkWords {
 		end := start + chunkWords
 		if end > len(words) {
@@ -658,19 +690,19 @@ func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offse
 		}
 		text := strings.Join(words[start:end], " ")
 		id := string(tenantID) + ":chunk:" + strconv.Itoa(offset+len(chunks))
-		chunks = append(chunks, chunk{
-			id: id,
-			source: brainapi.Source{
+		chunks = append(chunks, Chunk{
+			ID: id,
+			Source: brainapi.Source{
 				ID:       string(tenantID) + ":source:" + strconv.Itoa(sourceIndex),
 				Title:    doc.title,
 				URI:      doc.source.URI,
 				TenantID: tenantID,
 			},
-			text:    text,
-			terms:   terms(text),
-			vector:  emb.Embed(text),
-			freshAt: doc.freshAt,
-			kind:    doc.source.MimeType,
+			Text:    text,
+			Terms:   terms(text),
+			Vector:  emb.Embed(text),
+			FreshAt: doc.freshAt,
+			Kind:    doc.source.MimeType,
 		})
 	}
 	return chunks
@@ -679,10 +711,10 @@ func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offse
 // rankChunks scores and sorts chunks by overlap*2 + cosine. questionTerms and
 // questionVector must be pre-computed by the caller so that they can use the
 // configured Embedder rather than the package-level embed function.
-func rankChunks(questionTerms map[string]int, questionVector []float64, chunks []chunk) []scoredChunk {
+func rankChunks(questionTerms map[string]int, questionVector []float64, chunks []Chunk) []scoredChunk {
 	ranked := make([]scoredChunk, 0, len(chunks))
 	for i, ch := range chunks {
-		score := float64(overlap(questionTerms, ch.terms))*2 + cosine(questionVector, ch.vector)
+		score := float64(overlap(questionTerms, ch.Terms))*2 + cosine(questionVector, ch.Vector)
 		ranked = append(ranked, scoredChunk{chunk: ch, score: score, order: i})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
@@ -694,27 +726,27 @@ func rankChunks(questionTerms map[string]int, questionVector []float64, chunks [
 	return ranked
 }
 
-func topChunks(ranked []scoredChunk, limit int) []chunk {
+func topChunks(ranked []scoredChunk, limit int) []Chunk {
 	if len(ranked) < limit {
 		limit = len(ranked)
 	}
-	out := make([]chunk, 0, limit)
+	out := make([]Chunk, 0, limit)
 	for i := 0; i < limit; i++ {
 		out = append(out, ranked[i].chunk)
 	}
 	return out
 }
 
-func uniqueSources(chunks []chunk) []brainapi.Source {
+func uniqueSources(chunks []Chunk) []brainapi.Source {
 	seen := make(map[string]bool)
 	sources := make([]brainapi.Source, 0, len(chunks))
 	for _, ch := range chunks {
-		key := ch.source.ID
+		key := ch.Source.ID
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		sources = append(sources, ch.source)
+		sources = append(sources, ch.Source)
 	}
 	return sources
 }

@@ -308,7 +308,7 @@ func TestCoreQueryWithoutSourcesAndRetrievalHelpers(t *testing.T) {
 	}
 	blankDoc := document{source: brainapi.SourceRef{URI: "text://blank", Name: "blank"}, title: "blank", freshAt: time.Unix(0, 0)}
 	blankChunks := chunksFrom("tenant-a", 0, blankDoc, 0, localEmbedder{})
-	if len(blankChunks) != 1 || blankChunks[0].text != "blank" {
+	if len(blankChunks) != 1 || blankChunks[0].Text != "blank" {
 		t.Fatalf("blank chunks = %+v", blankChunks)
 	}
 	left := map[string]int{"x": 1, "y": 3}
@@ -319,7 +319,7 @@ func TestCoreQueryWithoutSourcesAndRetrievalHelpers(t *testing.T) {
 	if got := cosine(nilVector(), embed("x")); got != 0 {
 		t.Fatalf("zero cosine = %f", got)
 	}
-	tied := rankChunks(terms("nomatch"), embed("nomatch"), []chunk{{text: "a", terms: terms("a"), vector: embed("a")}, {text: "b", terms: terms("b"), vector: embed("b")}})
+	tied := rankChunks(terms("nomatch"), embed("nomatch"), []Chunk{{Text: "a", Terms: terms("a"), Vector: embed("a")}, {Text: "b", Terms: terms("b"), Vector: embed("b")}})
 	if len(tied) != 2 || tied[0].order != 0 {
 		t.Fatalf("stable rank = %+v", tied)
 	}
@@ -723,6 +723,24 @@ func TestWithEmbedderAndVectorStoreOptions(t *testing.T) {
 		t.Parallel()
 		core := New(WithVectorStore(newInMemoryVectorStore()))
 		mustCreate(t, core, "tenant-a", "api:space:A")
+	})
+
+	t.Run("exported_NewInMemoryVectorStore_is_usable", func(t *testing.T) {
+		t.Parallel()
+		// NewInMemoryVectorStore is the exported constructor for external
+		// VectorStore contract testing; verify it returns a working store.
+		core := New(WithVectorStore(NewInMemoryVectorStore()))
+		mustCreate(t, core, "tenant-a", "api:space:A")
+		ctx := context.Background()
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "tenant-a", JobID: "job-1",
+			Source: brainapi.SourceRef{URI: "file://test.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest with exported store: %v", err)
+		}
+		if _, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "test"}); err != nil {
+			t.Fatalf("Query with exported store: %v", err)
+		}
 	})
 }
 

@@ -73,7 +73,7 @@ func (c *Core) loadSnapshot() error {
 	docs := make(map[brainapi.TenantID][]document, len(snap.Docs))
 	// chunks is built locally then pushed to c.vectorStore so the VectorStore
 	// seam receives a clean Replace rather than incremental Adds.
-	chunksByTenant := make(map[brainapi.TenantID][]chunk, len(snap.Docs))
+	chunksByTenant := make(map[brainapi.TenantID][]Chunk, len(snap.Docs))
 	for tenantID, persistedDocs := range snap.Docs {
 		docs[tenantID] = make([]document, 0, len(persistedDocs))
 		for sourceIndex, persistedDoc := range persistedDocs {
