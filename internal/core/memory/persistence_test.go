@@ -142,6 +142,80 @@ func TestPersistentCoreWrapsWriteErrors(t *testing.T) {
 	if !strings.Contains(err.Error(), "persist_snapshot") {
 		t.Fatalf("persist error not wrapped with op: %v", err)
 	}
+	// After rollback the in-memory state must be clean: the binding must not exist.
+	_, resolveErr := core.ResolveBinding(context.Background(), "api:space:A")
+	if !brainapi.IsKind(resolveErr, brainapi.KindNotFound) {
+		t.Fatalf("binding should not exist after CreateProject rollback, kind=%q err=%v", brainapi.KindOf(resolveErr), resolveErr)
+	}
+}
+
+// TestMutationRollsBackOnPersistFailure verifies that Ingest, CompleteJob, and
+// SetProjectState roll back their in-memory writes atomically when persistLocked fails.
+// marshalSnapshot is injected to trigger a deterministic persist failure without
+// touching the filesystem.
+func TestMutationRollsBackOnPersistFailure(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ingest", func(t *testing.T) {
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
+
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "file://a"}})
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("ingest persist fail kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		// After rollback the job must not exist.
+		_, jobErr := core.JobStatus(ctx, "tenant-a", "job-1")
+		if !brainapi.IsKind(jobErr, brainapi.KindNotFound) {
+			t.Fatalf("job should be rolled back, kind=%q err=%v", brainapi.KindOf(jobErr), jobErr)
+		}
+	})
+
+	t.Run("complete_job", func(t *testing.T) {
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
+		core.jobs[jobKey("tenant-a", "job-1")] = brainapi.JobSnapshot{TenantID: "tenant-a", JobID: "job-1", Status: brainapi.JobRunning}
+
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.CompleteJob("tenant-a", "job-1", brainapi.JobCompleted, "result://1", "")
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("complete job persist fail kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		// After rollback the job must still be Running.
+		status, statusErr := core.JobStatus(ctx, "tenant-a", "job-1")
+		if statusErr != nil {
+			t.Fatalf("JobStatus after rollback: %v", statusErr)
+		}
+		if status.Status != brainapi.JobRunning {
+			t.Fatalf("status should be rolled back to Running, got %q", status.Status)
+		}
+	})
+
+	t.Run("set_project_state", func(t *testing.T) {
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
+
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.SetProjectState(ctx, "tenant-a", brainapi.ProjectOff)
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("set state persist fail kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		// After rollback the project must still be On: Query must not return KindConflict.
+		_, queryErr := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "test"})
+		if queryErr != nil {
+			t.Fatalf("project should be rolled back to On state, got err: %v", queryErr)
+		}
+	})
 }
 
 func TestPersistentCoreWrapsMarshalErrors(t *testing.T) {

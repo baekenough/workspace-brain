@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,18 +16,92 @@ import (
 
 const embeddingDimensions = 16
 
+// ─── Consumer-side seam interfaces ──────────────────────────────────────────
+
+// Embedder converts a text string into a fixed-length embedding vector.
+// Implementations must be deterministic for the same input.
+// Memory never imports internal/core/ai; this is the consumer-side declaration.
+type Embedder interface {
+	Embed(text string) []float64
+}
+
+// VectorStore stores pre-embedded chunks and performs ranked similarity search.
+// All methods are tenant-scoped to preserve isolation guarantees.
+// VectorStore methods are called while Core.mu is held; the in-memory default
+// therefore requires no additional synchronisation of its own.
+type VectorStore interface {
+	// Add appends chunks for a tenant (called during Ingest).
+	Add(tenantID brainapi.TenantID, chunks []chunk)
+	// Search returns the top-limit ranked chunks matching the pre-embedded query.
+	Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []chunk
+	// Len returns the current chunk count for a tenant (used before Ingest for rollback).
+	Len(tenantID brainapi.TenantID) int
+	// TruncateTo removes chunks beyond n for a tenant (Ingest rollback on persist failure).
+	TruncateTo(tenantID brainapi.TenantID, n int)
+	// Replace overwrites all chunks for a tenant (used during snapshot load).
+	Replace(tenantID brainapi.TenantID, chunks []chunk)
+}
+
+// ─── Default (local) implementations ────────────────────────────────────────
+
+// localEmbedder is the default Embedder. It uses the deterministic FNV-1a
+// bag-of-terms hashing that the core used before the seam was introduced, so
+// all vectors and rankings remain identical to the original behaviour.
+type localEmbedder struct{}
+
+func (localEmbedder) Embed(text string) []float64 {
+	return embed(text)
+}
+
+// inMemoryVectorStore is the default VectorStore. It reproduces the original
+// ranking formula exactly: score = overlap(terms)*2 + cosine(vectors), top-N.
+type inMemoryVectorStore struct {
+	chunks map[brainapi.TenantID][]chunk
+}
+
+func newInMemoryVectorStore() *inMemoryVectorStore {
+	return &inMemoryVectorStore{chunks: make(map[brainapi.TenantID][]chunk)}
+}
+
+func (s *inMemoryVectorStore) Add(tenantID brainapi.TenantID, chunks []chunk) {
+	s.chunks[tenantID] = append(s.chunks[tenantID], chunks...)
+}
+
+func (s *inMemoryVectorStore) Search(tenantID brainapi.TenantID, questionTerms map[string]int, questionVector []float64, limit int) []chunk {
+	return topChunks(rankChunks(questionTerms, questionVector, s.chunks[tenantID]), limit)
+}
+
+func (s *inMemoryVectorStore) Len(tenantID brainapi.TenantID) int {
+	return len(s.chunks[tenantID])
+}
+
+func (s *inMemoryVectorStore) TruncateTo(tenantID brainapi.TenantID, n int) {
+	if n < len(s.chunks[tenantID]) {
+		s.chunks[tenantID] = s.chunks[tenantID][:n]
+	}
+}
+
+func (s *inMemoryVectorStore) Replace(tenantID brainapi.TenantID, chunks []chunk) {
+	dst := make([]chunk, len(chunks))
+	copy(dst, chunks)
+	s.chunks[tenantID] = dst
+}
+
+// ─── Core ────────────────────────────────────────────────────────────────────
+
 // Core is a thread-safe in-memory implementation of brainapi.Core.
 type Core struct {
 	mu              sync.RWMutex
 	now             func() time.Time
 	persistencePath string
 	initErr         error
+	embedder        Embedder
+	vectorStore     VectorStore
 	bindings        map[brainapi.BindingKey]brainapi.TenantID
 	projects        map[brainapi.TenantID]project
 	jobs            map[string]brainapi.JobSnapshot
 	sources         map[brainapi.TenantID][]brainapi.SourceRef
 	docs            map[brainapi.TenantID][]document
-	chunks          map[brainapi.TenantID][]chunk
 }
 
 type project struct {
@@ -58,6 +133,8 @@ type scoredChunk struct {
 	order int
 }
 
+// ─── Options ─────────────────────────────────────────────────────────────────
+
 // Option configures Core.
 type Option func(*Core)
 
@@ -76,6 +153,28 @@ func WithPersistence(path string) Option {
 		c.persistencePath = strings.TrimSpace(path)
 	}
 }
+
+// WithEmbedder replaces the default localEmbedder with emb.
+// A nil emb is silently ignored (the default is kept).
+func WithEmbedder(emb Embedder) Option {
+	return func(c *Core) {
+		if emb != nil {
+			c.embedder = emb
+		}
+	}
+}
+
+// WithVectorStore replaces the default inMemoryVectorStore with vs.
+// A nil vs is silently ignored (the default is kept).
+func WithVectorStore(vs VectorStore) Option {
+	return func(c *Core) {
+		if vs != nil {
+			c.vectorStore = vs
+		}
+	}
+}
+
+// ─── Constructors ────────────────────────────────────────────────────────────
 
 // New creates an empty in-memory data core.
 func New(opts ...Option) *Core {
@@ -98,19 +197,22 @@ func NewPersistent(path string, opts ...Option) (*Core, error) {
 
 func newCore(opts ...Option) *Core {
 	c := &Core{
-		now:      time.Now,
-		bindings: make(map[brainapi.BindingKey]brainapi.TenantID),
-		projects: make(map[brainapi.TenantID]project),
-		jobs:     make(map[string]brainapi.JobSnapshot),
-		sources:  make(map[brainapi.TenantID][]brainapi.SourceRef),
-		docs:     make(map[brainapi.TenantID][]document),
-		chunks:   make(map[brainapi.TenantID][]chunk),
+		now:         time.Now,
+		embedder:    localEmbedder{},
+		vectorStore: newInMemoryVectorStore(),
+		bindings:    make(map[brainapi.BindingKey]brainapi.TenantID),
+		projects:    make(map[brainapi.TenantID]project),
+		jobs:        make(map[string]brainapi.JobSnapshot),
+		sources:     make(map[brainapi.TenantID][]brainapi.SourceRef),
+		docs:        make(map[brainapi.TenantID][]document),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
 }
+
+// ─── Core methods ─────────────────────────────────────────────────────────────
 
 // ResolveBinding returns tenant_id for a surface-neutral binding key.
 func (c *Core) ResolveBinding(ctx context.Context, binding brainapi.BindingKey) (brainapi.TenantID, error) {
@@ -155,7 +257,12 @@ func (c *Core) CreateProject(ctx context.Context, req brainapi.CreateProjectRequ
 	}
 	c.projects[req.TenantID] = project{owner: req.OwnerPrincipal, metadata: cloneMap(req.Metadata), state: brainapi.ProjectOn}
 	c.bindings[req.BindingKey] = req.TenantID
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		delete(c.projects, req.TenantID)
+		delete(c.bindings, req.BindingKey)
+		return err
+	}
+	return nil
 }
 
 // Ingest stores source metadata, creates deterministic chunks, and records a running job.
@@ -182,14 +289,24 @@ func (c *Core) Ingest(ctx context.Context, req brainapi.IngestRequest) error {
 	if _, ok := c.jobs[key]; ok {
 		return brainapi.E(brainapi.KindAlreadyExists, "ingest", "job already exists", nil)
 	}
+	sourcesBefore := len(c.sources[req.TenantID])
+	docsBefore := len(c.docs[req.TenantID])
+	chunksBefore := c.vectorStore.Len(req.TenantID)
+
 	doc := documentFrom(req, c.now().UTC())
-	sourceIndex := len(c.sources[req.TenantID])
-	newChunks := chunksFrom(req.TenantID, sourceIndex, doc, len(c.chunks[req.TenantID]))
+	newChunks := chunksFrom(req.TenantID, sourcesBefore, doc, chunksBefore, c.embedder)
 	c.sources[req.TenantID] = append(c.sources[req.TenantID], req.Source)
 	c.docs[req.TenantID] = append(c.docs[req.TenantID], doc)
-	c.chunks[req.TenantID] = append(c.chunks[req.TenantID], newChunks...)
+	c.vectorStore.Add(req.TenantID, newChunks)
 	c.jobs[key] = brainapi.JobSnapshot{TenantID: req.TenantID, JobID: req.JobID, Status: brainapi.JobRunning, UpdatedAt: c.now().UTC()}
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.sources[req.TenantID] = c.sources[req.TenantID][:sourcesBefore]
+		c.docs[req.TenantID] = c.docs[req.TenantID][:docsBefore]
+		c.vectorStore.TruncateTo(req.TenantID, chunksBefore)
+		delete(c.jobs, key)
+		return err
+	}
+	return nil
 }
 
 // CompleteJob marks a job terminal. It simulates worker callback state for tests and demos.
@@ -207,12 +324,17 @@ func (c *Core) CompleteJob(tenantID brainapi.TenantID, jobID brainapi.JobID, sta
 	if !ok {
 		return brainapi.E(brainapi.KindNotFound, "complete_job", "job not found", nil)
 	}
+	oldSnapshot := snapshot
 	snapshot.Status = status
 	snapshot.ResultRef = resultRef
 	snapshot.Error = message
 	snapshot.UpdatedAt = c.now().UTC()
 	c.jobs[key] = snapshot
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		c.jobs[key] = oldSnapshot
+		return err
+	}
+	return nil
 }
 
 // JobStatus returns tenant-scoped job state.
@@ -254,11 +376,12 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	if err := c.requireProjectLocked(req.TenantID, "query"); err != nil {
 		return brainapi.QueryResponse{}, err
 	}
-	ranked := rankChunks(question, c.chunks[req.TenantID])
-	if len(ranked) == 0 {
+	questionTerms := terms(question)
+	questionVector := c.embedder.Embed(question)
+	top := c.vectorStore.Search(req.TenantID, questionTerms, questionVector, 3)
+	if len(top) == 0 {
 		return brainapi.QueryResponse{Answer: "수집된 근거가 없습니다: " + question, GroundingAvailable: false}, nil
 	}
-	top := topChunks(ranked, 3)
 	return brainapi.QueryResponse{
 		Answer:             synthesize(question, top),
 		Sources:            uniqueSources(top),
@@ -288,7 +411,7 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 		if len(queryTerms) > 0 && overlap(queryTerms, terms(doc.title+" "+doc.source.URI+" "+doc.content)) == 0 {
 			continue
 		}
-		results = append(results, brainapi.MetadataResult{ID: string(req.TenantID) + ":metadata:" + string(rune('a'+i%26)), Title: doc.title, Kind: doc.source.MimeType, FreshAt: doc.freshAt})
+		results = append(results, brainapi.MetadataResult{ID: string(req.TenantID) + ":metadata:" + strconv.Itoa(i), Title: doc.title, Kind: doc.source.MimeType, FreshAt: doc.freshAt})
 	}
 	return brainapi.DiscoverResponse{Results: results}, nil
 }
@@ -311,10 +434,18 @@ func (c *Core) SetProjectState(ctx context.Context, tenantID brainapi.TenantID, 
 	if !ok {
 		return brainapi.E(brainapi.KindNotFound, "set_project_state", "tenant not found", nil)
 	}
+	oldState := proj.state
 	proj.state = state
 	c.projects[tenantID] = proj
-	return c.persistLocked()
+	if err := c.persistLocked(); err != nil {
+		proj.state = oldState
+		c.projects[tenantID] = proj
+		return err
+	}
+	return nil
 }
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
 func (c *Core) requireReadyLocked(op string) error {
 	if c.initErr != nil {
@@ -346,7 +477,10 @@ func documentFrom(req brainapi.IngestRequest, freshAt time.Time) document {
 	return document{source: req.Source, title: title, content: content, freshAt: freshAt}
 }
 
-func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offset int) []chunk {
+// chunksFrom splits doc content into fixed-width word chunks and embeds each
+// using emb. The Embedder is threaded in so callers can swap the embedding
+// strategy without touching this function.
+func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offset int, emb Embedder) []chunk {
 	words := strings.Fields(doc.content)
 	if len(words) == 0 {
 		words = []string{doc.title}
@@ -359,18 +493,18 @@ func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offse
 			end = len(words)
 		}
 		text := strings.Join(words[start:end], " ")
-		id := string(tenantID) + ":chunk:" + string(rune('a'+(offset+len(chunks))%26))
+		id := string(tenantID) + ":chunk:" + strconv.Itoa(offset+len(chunks))
 		chunks = append(chunks, chunk{
 			id: id,
 			source: brainapi.Source{
-				ID:       string(tenantID) + ":source:" + string(rune('a'+sourceIndex%26)),
+				ID:       string(tenantID) + ":source:" + strconv.Itoa(sourceIndex),
 				Title:    doc.title,
 				URI:      doc.source.URI,
 				TenantID: tenantID,
 			},
 			text:    text,
 			terms:   terms(text),
-			vector:  embed(text),
+			vector:  emb.Embed(text),
 			freshAt: doc.freshAt,
 			kind:    doc.source.MimeType,
 		})
@@ -378,9 +512,10 @@ func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offse
 	return chunks
 }
 
-func rankChunks(question string, chunks []chunk) []scoredChunk {
-	questionTerms := terms(question)
-	questionVector := embed(question)
+// rankChunks scores and sorts chunks by overlap*2 + cosine. questionTerms and
+// questionVector must be pre-computed by the caller so that they can use the
+// configured Embedder rather than the package-level embed function.
+func rankChunks(questionTerms map[string]int, questionVector []float64, chunks []chunk) []scoredChunk {
 	ranked := make([]scoredChunk, 0, len(chunks))
 	for i, ch := range chunks {
 		score := float64(overlap(questionTerms, ch.terms))*2 + cosine(questionVector, ch.vector)
@@ -464,7 +599,7 @@ func overlap(left, right map[string]int) int {
 func embed(text string) []float64 {
 	vector := make([]float64, embeddingDimensions)
 	for token, count := range terms(text) {
-		idx := stableHash(token) % embeddingDimensions
+		idx := int(stableHash(token) % uint32(embeddingDimensions))
 		vector[idx] += float64(count)
 	}
 	return vector
@@ -483,13 +618,17 @@ func cosine(left, right []float64) float64 {
 	return dot / (math.Sqrt(leftNorm) * math.Sqrt(rightNorm))
 }
 
-func stableHash(token string) int {
+// stableHash returns a uint32 FNV-1a hash of token. Returning uint32 (not int)
+// ensures stableHash(token) % uint32(embeddingDimensions) is always non-negative,
+// preventing a panic on 32-bit platforms where int is 32 bits and converting a
+// large uint32 to int yields a negative value.
+func stableHash(token string) uint32 {
 	var h uint32 = 2166136261
 	for _, r := range token {
 		h ^= uint32(r)
 		h *= 16777619
 	}
-	return int(h)
+	return h
 }
 
 func cloneMap(in map[string]string) map[string]string {

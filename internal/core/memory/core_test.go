@@ -3,10 +3,12 @@ package memory
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sangyi/workspace-brain/internal/core/coretest"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
@@ -293,7 +295,7 @@ func TestCoreQueryWithoutSourcesAndRetrievalHelpers(t *testing.T) {
 		t.Fatalf("synthesize empty = %q", got)
 	}
 	blankDoc := document{source: brainapi.SourceRef{URI: "text://blank", Name: "blank"}, title: "blank", freshAt: time.Unix(0, 0)}
-	blankChunks := chunksFrom("tenant-a", 0, blankDoc, 0)
+	blankChunks := chunksFrom("tenant-a", 0, blankDoc, 0, localEmbedder{})
 	if len(blankChunks) != 1 || blankChunks[0].text != "blank" {
 		t.Fatalf("blank chunks = %+v", blankChunks)
 	}
@@ -305,13 +307,107 @@ func TestCoreQueryWithoutSourcesAndRetrievalHelpers(t *testing.T) {
 	if got := cosine(nilVector(), embed("x")); got != 0 {
 		t.Fatalf("zero cosine = %f", got)
 	}
-	tied := rankChunks("nomatch", []chunk{{text: "a", terms: terms("a"), vector: embed("a")}, {text: "b", terms: terms("b"), vector: embed("b")}})
+	tied := rankChunks(terms("nomatch"), embed("nomatch"), []chunk{{text: "a", terms: terms("a"), vector: embed("a")}, {text: "b", terms: terms("b"), vector: embed("b")}})
 	if len(tied) != 2 || tied[0].order != 0 {
 		t.Fatalf("stable rank = %+v", tied)
 	}
 }
 
 func nilVector() []float64 { return make([]float64, embeddingDimensions) }
+
+// TestMemoryCoreContractSuite runs the reusable black-box contract suite
+// against the in-memory Core so any future backend (PostgreSQL, Qdrant) can
+// validate identical behaviour with the same helper.
+func TestMemoryCoreContractSuite(t *testing.T) {
+	coretest.RunContractSuite(t, func() brainapi.Core { return New() })
+}
+
+// TestWithEmbedderAndVectorStoreOptions exercises the new option paths introduced
+// by the WB-01 seam refactor. Coverage requires both nil (keep default) and
+// non-nil (replace) branches for each option.
+func TestWithEmbedderAndVectorStoreOptions(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil_embedder_keeps_default", func(t *testing.T) {
+		t.Parallel()
+		core := New(WithEmbedder(nil))
+		mustCreate(t, core, "tenant-a", "api:space:A")
+		// Ingest + Query smoke-test to confirm the default embedder works.
+		ctx := context.Background()
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "tenant-a", JobID: "job-1",
+			Source: brainapi.SourceRef{URI: "file://test.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		if _, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "test"}); err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+	})
+
+	t.Run("non_nil_embedder_is_used", func(t *testing.T) {
+		t.Parallel()
+		core := New(WithEmbedder(localEmbedder{}))
+		mustCreate(t, core, "tenant-a", "api:space:A")
+	})
+
+	t.Run("nil_vectorstore_keeps_default", func(t *testing.T) {
+		t.Parallel()
+		core := New(WithVectorStore(nil))
+		mustCreate(t, core, "tenant-a", "api:space:A")
+	})
+
+	t.Run("non_nil_vectorstore_is_used", func(t *testing.T) {
+		t.Parallel()
+		core := New(WithVectorStore(newInMemoryVectorStore()))
+		mustCreate(t, core, "tenant-a", "api:space:A")
+	})
+}
+
+// TestCoreSourceIDsDistinctBeyond26Sources is a regression guard for the modulo-26
+// source/chunk ID collision. Before the fix, source at index 0 and source at index 26
+// both received ID "tenant-a:source:a" (0%26 == 26%26 == 0), causing uniqueSources to
+// drop one of them as a duplicate. After the fix (strconv.Itoa), IDs are "tenant-a:source:0"
+// and "tenant-a:source:26", which are distinct, so both appear in citations.
+func TestCoreSourceIDsDistinctBeyond26Sources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	core := New()
+	mustCreate(t, core, "tenant-a", "slack:channel:C1")
+
+	// Sources 0 and 26 both have content matching the query "alpha"; all others are irrelevant.
+	// With the modulo-26 bug, their shared ID caused uniqueSources to collapse them into one.
+	for i := 0; i < 27; i++ {
+		content := "irrelevant xyz"
+		if i == 0 || i == 26 {
+			content = "the alpha document"
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "tenant-a",
+			JobID:    brainapi.JobID("job-" + strconv.Itoa(i)),
+			Source:   brainapi.SourceRef{URI: "file://src-" + strconv.Itoa(i)},
+			Metadata: map[string]string{"content": content},
+		}); err != nil {
+			t.Fatalf("Ingest[%d]: %v", i, err)
+		}
+	}
+
+	answer, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "alpha"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+
+	seenURIs := make(map[string]bool, len(answer.Sources))
+	for _, src := range answer.Sources {
+		seenURIs[src.URI] = true
+	}
+	if !seenURIs["file://src-0"] {
+		t.Fatalf("source at index 0 (file://src-0) absent from citations: %+v", answer.Sources)
+	}
+	if !seenURIs["file://src-26"] {
+		t.Fatalf("source at index 26 (file://src-26) absent from citations: %+v", answer.Sources)
+	}
+}
 
 func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
 	t.Parallel()

@@ -71,13 +71,15 @@ func (c *Core) loadSnapshot() error {
 		sources[tenantID] = append([]brainapi.SourceRef(nil), refs...)
 	}
 	docs := make(map[brainapi.TenantID][]document, len(snap.Docs))
-	chunks := make(map[brainapi.TenantID][]chunk, len(snap.Docs))
+	// chunks is built locally then pushed to c.vectorStore so the VectorStore
+	// seam receives a clean Replace rather than incremental Adds.
+	chunksByTenant := make(map[brainapi.TenantID][]chunk, len(snap.Docs))
 	for tenantID, persistedDocs := range snap.Docs {
 		docs[tenantID] = make([]document, 0, len(persistedDocs))
 		for sourceIndex, persistedDoc := range persistedDocs {
 			doc := document{source: persistedDoc.Source, title: persistedDoc.Title, content: persistedDoc.Content, freshAt: persistedDoc.FreshAt}
 			docs[tenantID] = append(docs[tenantID], doc)
-			chunks[tenantID] = append(chunks[tenantID], chunksFrom(tenantID, sourceIndex, doc, len(chunks[tenantID]))...)
+			chunksByTenant[tenantID] = append(chunksByTenant[tenantID], chunksFrom(tenantID, sourceIndex, doc, len(chunksByTenant[tenantID]), c.embedder)...)
 		}
 	}
 
@@ -86,7 +88,12 @@ func (c *Core) loadSnapshot() error {
 	c.jobs = jobs
 	c.sources = sources
 	c.docs = docs
-	c.chunks = chunks
+	for tenantID, chunks := range chunksByTenant {
+		c.vectorStore.Replace(tenantID, chunks)
+	}
+	// TODO(WB-01-followup): abstract the durable snapshot store behind a
+	// PersistenceStore interface so PostgreSQL or object-storage backends can
+	// plug in here without re-refactoring the core.
 	return nil
 }
 

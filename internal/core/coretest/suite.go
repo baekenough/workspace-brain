@@ -1,0 +1,483 @@
+// Package coretest provides a reusable black-box contract test suite for any
+// implementation of brainapi.Core. Tests operate exclusively through the public
+// interface so the same suite can validate in-memory, PostgreSQL, Qdrant, or any
+// other backend without touching unexported internals.
+package coretest
+
+import (
+	"context"
+	"testing"
+
+	"github.com/sangyi/workspace-brain/pkg/brainapi"
+)
+
+// RunContractSuite runs the brainapi.Core behavioral contract tests against the
+// implementation returned by newCore. newCore must return a fresh, empty Core on
+// every call so that sub-tests are independent and can run in parallel.
+//
+// Assumptions about the implementation under test:
+//   - Ingest processing is synchronous: chunks are searchable immediately after
+//     Ingest returns without error.
+//   - Duplicate detection (AlreadyExists) is scoped to the same Core instance.
+func RunContractSuite(t *testing.T, newCore func() brainapi.Core) {
+	t.Helper()
+	ctx := context.Background()
+
+	// ─── CreateProject / ResolveBinding ─────────────────────────────────────
+
+	t.Run("create_project_and_resolve_binding", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		req := brainapi.CreateProjectRequest{
+			TenantID:       "contract-tenant-a",
+			BindingKey:     "api:space:CTA",
+			OwnerPrincipal: brainapi.Principal{ID: "owner-1"},
+		}
+		if err := core.CreateProject(ctx, req); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		tenantID, err := core.ResolveBinding(ctx, "api:space:CTA")
+		if err != nil {
+			t.Fatalf("ResolveBinding: %v", err)
+		}
+		if tenantID != "contract-tenant-a" {
+			t.Fatalf("got tenant %q, want contract-tenant-a", tenantID)
+		}
+	})
+
+	t.Run("create_project_duplicate_tenant", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		req := brainapi.CreateProjectRequest{
+			TenantID:       "contract-dup-tenant",
+			BindingKey:     "api:space:CDUP",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}
+		if err := core.CreateProject(ctx, req); err != nil {
+			t.Fatalf("first CreateProject: %v", err)
+		}
+		err := core.CreateProject(ctx, req)
+		if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+			t.Fatalf("duplicate tenant: want AlreadyExists, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("create_project_duplicate_binding", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		req := brainapi.CreateProjectRequest{
+			TenantID:       "contract-dup-binding-a",
+			BindingKey:     "api:space:CDBA",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}
+		if err := core.CreateProject(ctx, req); err != nil {
+			t.Fatalf("first CreateProject: %v", err)
+		}
+		err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-dup-binding-b",
+			BindingKey:     "api:space:CDBA", // same binding, different tenant
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		})
+		if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+			t.Fatalf("duplicate binding: want AlreadyExists, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("resolve_missing_binding_returns_not_found", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		_, err := core.ResolveBinding(ctx, "api:space:MISSING")
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("missing binding: want NotFound, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	// ─── Ingest / JobStatus ─────────────────────────────────────────────────
+
+	t.Run("ingest_creates_running_job", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-ingest-tenant",
+			BindingKey:     "api:space:CIT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-ingest-tenant",
+			JobID:    "contract-job-1",
+			Source:   brainapi.SourceRef{URI: "file://ingest.txt", Name: "ingest.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		status, err := core.JobStatus(ctx, "contract-ingest-tenant", "contract-job-1")
+		if err != nil {
+			t.Fatalf("JobStatus: %v", err)
+		}
+		if status.Status != brainapi.JobRunning {
+			t.Fatalf("job status = %q, want Running", status.Status)
+		}
+		if status.TenantID != "contract-ingest-tenant" {
+			t.Fatalf("job tenant = %q, want contract-ingest-tenant", status.TenantID)
+		}
+	})
+
+	t.Run("ingest_duplicate_job_returns_already_exists", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-dupjob-tenant",
+			BindingKey:     "api:space:CDJ",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		req := brainapi.IngestRequest{
+			TenantID: "contract-dupjob-tenant",
+			JobID:    "contract-job-dup",
+			Source:   brainapi.SourceRef{URI: "file://dup.txt"},
+		}
+		if err := core.Ingest(ctx, req); err != nil {
+			t.Fatalf("first Ingest: %v", err)
+		}
+		err := core.Ingest(ctx, req)
+		if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+			t.Fatalf("duplicate job: want AlreadyExists, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("job_status_not_found_for_missing_job", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-nojob-tenant",
+			BindingKey:     "api:space:CNJ",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		_, err := core.JobStatus(ctx, "contract-nojob-tenant", "does-not-exist")
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("missing job: want NotFound, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	// ─── Query ──────────────────────────────────────────────────────────────
+
+	t.Run("query_without_sources_returns_no_grounding", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-noground-tenant",
+			BindingKey:     "api:space:CNG",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		resp, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-noground-tenant",
+			Question: "what is the meaning of everything",
+		})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if resp.GroundingAvailable {
+			t.Fatalf("GroundingAvailable = true, want false when no sources ingested")
+		}
+	})
+
+	t.Run("query_with_sources_returns_grounding", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-ground-tenant",
+			BindingKey:     "api:space:CGT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-ground-tenant",
+			JobID:    "contract-ground-job",
+			Source:   brainapi.SourceRef{URI: "file://knowledge.txt", Name: "knowledge.txt"},
+			Metadata: map[string]string{"content": "contract knowledge base alpha beta gamma"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		resp, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-ground-tenant",
+			Question: "knowledge alpha",
+		})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if !resp.GroundingAvailable {
+			t.Fatalf("GroundingAvailable = false, want true after ingest")
+		}
+		if len(resp.Sources) == 0 {
+			t.Fatalf("Sources is empty, want at least one source")
+		}
+		for _, src := range resp.Sources {
+			if src.TenantID != "contract-ground-tenant" {
+				t.Fatalf("source TenantID = %q, want contract-ground-tenant", src.TenantID)
+			}
+		}
+	})
+
+	t.Run("query_tenant_isolation", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		// Tenant A ingests content with "secret" keyword.
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-iso-a",
+			BindingKey:     "api:space:CISA",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject A: %v", err)
+		}
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-iso-b",
+			BindingKey:     "api:space:CISB",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject B: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-iso-a",
+			JobID:    "contract-iso-job-a",
+			Source:   brainapi.SourceRef{URI: "file://secret-a.txt"},
+			Metadata: map[string]string{"content": "secret information for tenant a only"},
+		}); err != nil {
+			t.Fatalf("Ingest A: %v", err)
+		}
+		// Query from tenant B must not see tenant A's data.
+		resp, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-iso-b",
+			Question: "secret",
+		})
+		if err != nil {
+			t.Fatalf("Query B: %v", err)
+		}
+		if resp.GroundingAvailable {
+			t.Fatalf("tenant B query returned grounding from tenant A's data: %+v", resp)
+		}
+		for _, src := range resp.Sources {
+			if src.TenantID == "contract-iso-a" {
+				t.Fatalf("tenant isolation broken: tenant B query returned source from tenant A")
+			}
+		}
+	})
+
+	// ─── Discover ───────────────────────────────────────────────────────────
+
+	t.Run("discover_returns_all_ingested_results", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-disc-tenant",
+			BindingKey:     "api:space:CDT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		for i, uri := range []string{"file://doc-alpha.txt", "file://doc-beta.txt"} {
+			jobID := brainapi.JobID("contract-disc-job-" + string(rune('1'+i)))
+			if err := core.Ingest(ctx, brainapi.IngestRequest{
+				TenantID: "contract-disc-tenant",
+				JobID:    jobID,
+				Source:   brainapi.SourceRef{URI: uri, Name: uri},
+			}); err != nil {
+				t.Fatalf("Ingest %s: %v", uri, err)
+			}
+		}
+		resp, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "contract-disc-tenant"})
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		if len(resp.Results) != 2 {
+			t.Fatalf("Discover got %d results, want 2", len(resp.Results))
+		}
+	})
+
+	t.Run("discover_with_query_filters_results", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-discf-tenant",
+			BindingKey:     "api:space:CDFT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-discf-tenant",
+			JobID:    "contract-discf-job-1",
+			Source:   brainapi.SourceRef{URI: "file://relevant.txt", Name: "relevant.txt"},
+			Metadata: map[string]string{"content": "needle in a haystack document"},
+		}); err != nil {
+			t.Fatalf("Ingest relevant: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-discf-tenant",
+			JobID:    "contract-discf-job-2",
+			Source:   brainapi.SourceRef{URI: "file://irrelevant.txt", Name: "irrelevant.txt"},
+			Metadata: map[string]string{"content": "unrelated content about other things"},
+		}); err != nil {
+			t.Fatalf("Ingest irrelevant: %v", err)
+		}
+		resp, err := core.Discover(ctx, brainapi.DiscoverRequest{
+			TenantID: "contract-discf-tenant",
+			Query:    "needle",
+		})
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		if len(resp.Results) != 1 {
+			t.Fatalf("Discover with filter got %d results, want 1: %+v", len(resp.Results), resp.Results)
+		}
+		if resp.Results[0].Title != "relevant.txt" {
+			t.Fatalf("Discover returned wrong result title %q, want relevant.txt", resp.Results[0].Title)
+		}
+	})
+
+	// ─── SetProjectState ─────────────────────────────────────────────────────
+
+	t.Run("project_off_blocks_query", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-off-query-tenant",
+			BindingKey:     "api:space:COQT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.SetProjectState(ctx, "contract-off-query-tenant", brainapi.ProjectOff); err != nil {
+			t.Fatalf("SetProjectState Off: %v", err)
+		}
+		_, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-off-query-tenant",
+			Question: "anything",
+		})
+		if !brainapi.IsKind(err, brainapi.KindConflict) {
+			t.Fatalf("Query on off project: want Conflict, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project_off_blocks_discover", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-off-disc-tenant",
+			BindingKey:     "api:space:CODT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.SetProjectState(ctx, "contract-off-disc-tenant", brainapi.ProjectOff); err != nil {
+			t.Fatalf("SetProjectState Off: %v", err)
+		}
+		_, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "contract-off-disc-tenant"})
+		if !brainapi.IsKind(err, brainapi.KindConflict) {
+			t.Fatalf("Discover on off project: want Conflict, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project_off_then_on_allows_query", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-toggle-tenant",
+			BindingKey:     "api:space:CTT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.SetProjectState(ctx, "contract-toggle-tenant", brainapi.ProjectOff); err != nil {
+			t.Fatalf("SetProjectState Off: %v", err)
+		}
+		if err := core.SetProjectState(ctx, "contract-toggle-tenant", brainapi.ProjectOn); err != nil {
+			t.Fatalf("SetProjectState On: %v", err)
+		}
+		// Query must succeed (even with no sources — just no grounding).
+		resp, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-toggle-tenant",
+			Question: "test",
+		})
+		if err != nil {
+			t.Fatalf("Query after re-enable: %v", err)
+		}
+		// No sources were ingested, so grounding must be unavailable.
+		if resp.GroundingAvailable {
+			t.Fatalf("GroundingAvailable = true with no sources, want false")
+		}
+	})
+
+	// ─── Validation ──────────────────────────────────────────────────────────
+
+	t.Run("validation_invalid_tenant_id", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "bad tenant id with spaces",
+			BindingKey:     "api:space:VTI",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid tenant id: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("validation_invalid_binding_key", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-vbk-tenant",
+			BindingKey:     "bad-binding",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid binding key: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("validation_blank_question", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-bq-tenant",
+			BindingKey:     "api:space:CBQ",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		_, err := core.Query(ctx, brainapi.QueryRequest{
+			TenantID: "contract-bq-tenant",
+			Question: "",
+		})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("blank question: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("validation_missing_source_uri", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-msu-tenant",
+			BindingKey:     "api:space:CMSU",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "contract-msu-tenant",
+			JobID:    "contract-msu-job",
+			Source:   brainapi.SourceRef{}, // empty URI
+		})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("missing source URI: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+}
