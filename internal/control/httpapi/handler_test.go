@@ -185,3 +185,19 @@ func (f *fakeGateway) SetProjectState(_ context.Context, cmd gateway.SetProjectS
 	}
 	return gateway.SetProjectStateResult{TenantID: cmd.TenantID, State: cmd.State}, nil
 }
+
+func (f *fakeGateway) AdminListTenants(context.Context, gateway.AdminListTenantsCommand) (gateway.AdminListTenantsResult, error) {
+	return gateway.AdminListTenantsResult{}, f.err
+}
+func (f *fakeGateway) AdminListBindings(context.Context, gateway.AdminListBindingsCommand) (gateway.AdminListBindingsResult, error) {
+	return gateway.AdminListBindingsResult{}, f.err
+}
+func (f *fakeGateway) AdminListSources(context.Context, gateway.AdminListSourcesCommand) (gateway.AdminListSourcesResult, error) {
+	return gateway.AdminListSourcesResult{}, f.err
+}
+func (f *fakeGateway) AdminListJobs(context.Context, gateway.AdminListJobsCommand) (gateway.AdminListJobsResult, error) {
+	return gateway.AdminListJobsResult{}, f.err
+}
+func (f *fakeGateway) AdminGetJob(context.Context, gateway.AdminGetJobCommand) (brainapi.JobSnapshot, error) {
+	return brainapi.JobSnapshot{}, f.err
+}

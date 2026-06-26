@@ -251,6 +251,13 @@ type fakeCore struct {
 	stateTenant brainapi.TenantID
 	state       brainapi.ProjectState
 	stateErr    error
+	// admin read stubs
+	adminListTenantsResp  brainapi.AdminListTenantsResponse
+	adminListBindingsResp brainapi.AdminListBindingsResponse
+	adminListSourcesResp  brainapi.AdminListSourcesResponse
+	adminListJobsResp     brainapi.AdminListJobsResponse
+	adminGetJobResp       brainapi.JobSnapshot
+	adminErr              error
 }
 
 func newFakeCore() *fakeCore { return &fakeCore{binding: "tenant-1"} }
@@ -282,6 +289,21 @@ func (f *fakeCore) SetProjectState(_ context.Context, tenantID brainapi.TenantID
 	f.stateTenant = tenantID
 	f.state = state
 	return f.stateErr
+}
+func (f *fakeCore) AdminListTenants(context.Context, brainapi.AdminListTenantsRequest) (brainapi.AdminListTenantsResponse, error) {
+	return f.adminListTenantsResp, f.adminErr
+}
+func (f *fakeCore) AdminListBindings(context.Context, brainapi.AdminListBindingsRequest) (brainapi.AdminListBindingsResponse, error) {
+	return f.adminListBindingsResp, f.adminErr
+}
+func (f *fakeCore) AdminListSources(context.Context, brainapi.TenantID) (brainapi.AdminListSourcesResponse, error) {
+	return f.adminListSourcesResp, f.adminErr
+}
+func (f *fakeCore) AdminListJobs(context.Context, brainapi.TenantID) (brainapi.AdminListJobsResponse, error) {
+	return f.adminListJobsResp, f.adminErr
+}
+func (f *fakeCore) AdminGetJob(context.Context, brainapi.TenantID, brainapi.JobID) (brainapi.JobSnapshot, error) {
+	return f.adminGetJobResp, f.adminErr
 }
 
 func TestRoleAuthorizerBranches(t *testing.T) {
@@ -787,6 +809,300 @@ func TestAuditLoggerEmitsOnSetProjectState(t *testing.T) {
 	}
 	if de := denySpy.all(); len(de) != 1 || de[0].Decision != audit.DecisionDeny {
 		t.Errorf("deny audit events: %+v", de)
+	}
+}
+
+// ── Admin read gateway tests ─────────────────────────────────────────────────
+
+// TestGatewayAdminListTenants verifies allow and deny paths for AdminListTenants.
+func TestGatewayAdminListTenants(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Allow: admin principal.
+	core := newFakeCore()
+	core.adminListTenantsResp = brainapi.AdminListTenantsResponse{
+		Tenants: []brainapi.TenantInfo{{TenantID: "t1", State: brainapi.ProjectOn, OwnerID: "o1"}},
+	}
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := gw.AdminListTenants(ctx, AdminListTenantsCommand{Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}})
+	if err != nil {
+		t.Fatalf("AdminListTenants allow: %v", err)
+	}
+	if len(result.Tenants) != 1 || result.Tenants[0].TenantID != "t1" {
+		t.Fatalf("tenants = %+v", result.Tenants)
+	}
+
+	// Deny: member principal.
+	_, err = gw.AdminListTenants(ctx, AdminListTenantsCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member AdminListTenants kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayAdminListBindings verifies allow (with and without tenant filter) and deny paths.
+func TestGatewayAdminListBindings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	core := newFakeCore()
+	core.adminListBindingsResp = brainapi.AdminListBindingsResponse{
+		Bindings: []brainapi.BindingInfo{{BindingKey: "api:space:T1", TenantID: "t1"}},
+	}
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+
+	// All bindings.
+	result, err := gw.AdminListBindings(ctx, AdminListBindingsCommand{Principal: admin})
+	if err != nil {
+		t.Fatalf("AdminListBindings all: %v", err)
+	}
+	if len(result.Bindings) != 1 {
+		t.Fatalf("bindings = %+v", result.Bindings)
+	}
+
+	// Filtered by tenant.
+	result, err = gw.AdminListBindings(ctx, AdminListBindingsCommand{Principal: admin, TenantID: "t1"})
+	if err != nil {
+		t.Fatalf("AdminListBindings filtered: %v", err)
+	}
+	if len(result.Bindings) != 1 {
+		t.Fatalf("bindings filtered = %+v", result.Bindings)
+	}
+
+	// Deny: member principal.
+	_, err = gw.AdminListBindings(ctx, AdminListBindingsCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member AdminListBindings kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayAdminListSources verifies allow, deny, and invalid tenant paths.
+func TestGatewayAdminListSources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	core := newFakeCore()
+	core.adminListSourcesResp = brainapi.AdminListSourcesResponse{
+		Sources: []brainapi.SourceInfo{{ID: "s1", TenantID: "tenant-1", Name: "doc.pdf"}},
+	}
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+
+	// Allow.
+	result, err := gw.AdminListSources(ctx, AdminListSourcesCommand{Principal: admin, TenantID: "tenant-1"})
+	if err != nil {
+		t.Fatalf("AdminListSources allow: %v", err)
+	}
+	if len(result.Sources) != 1 || result.Sources[0].Name != "doc.pdf" {
+		t.Fatalf("sources = %+v", result.Sources)
+	}
+
+	// Deny: member principal.
+	_, err = gw.AdminListSources(ctx, AdminListSourcesCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, TenantID: "tenant-1"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member AdminListSources kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid tenant ID.
+	_, err = gw.AdminListSources(ctx, AdminListSourcesCommand{Principal: admin, TenantID: "bad tenant"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad tenant AdminListSources kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayAdminListJobs verifies allow, deny, invalid tenant, and core error paths.
+func TestGatewayAdminListJobs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	core := newFakeCore()
+	core.adminListJobsResp = brainapi.AdminListJobsResponse{
+		Jobs: []brainapi.JobSnapshot{{TenantID: "tenant-1", JobID: "job-1", Status: brainapi.JobRunning}},
+	}
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+
+	// Allow.
+	result, err := gw.AdminListJobs(ctx, AdminListJobsCommand{Principal: admin, TenantID: "tenant-1"})
+	if err != nil {
+		t.Fatalf("AdminListJobs allow: %v", err)
+	}
+	if len(result.Jobs) != 1 || result.Jobs[0].JobID != "job-1" {
+		t.Fatalf("jobs = %+v", result.Jobs)
+	}
+
+	// Deny.
+	_, err = gw.AdminListJobs(ctx, AdminListJobsCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, TenantID: "tenant-1"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member AdminListJobs kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid tenant ID.
+	_, err = gw.AdminListJobs(ctx, AdminListJobsCommand{Principal: admin, TenantID: "bad tenant"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad tenant AdminListJobs kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Core error propagates.
+	errCore := newFakeCore()
+	errCore.adminErr = errors.New("core down")
+	gwErr, _ := New(errCore, RoleAuthorizer{}, jobs.NewStore())
+	_, err = gwErr.AdminListJobs(ctx, AdminListJobsCommand{Principal: admin, TenantID: "tenant-1"})
+	if err == nil || err.Error() != "core down" {
+		t.Fatalf("core error propagation: %v", err)
+	}
+}
+
+// TestGatewayAdminGetJob verifies allow, deny, validation, and audit-emit paths.
+func TestGatewayAdminGetJob(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	snap := brainapi.JobSnapshot{TenantID: "tenant-1", JobID: "job-1", Status: brainapi.JobCompleted}
+	core := newFakeCore()
+	core.adminGetJobResp = snap
+	spy := &spyAuditLogger{}
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+
+	// Allow — verifies audit event is emitted.
+	result, err := gw.AdminGetJob(ctx, AdminGetJobCommand{Principal: admin, TenantID: "tenant-1", JobID: "job-1"})
+	if err != nil {
+		t.Fatalf("AdminGetJob allow: %v", err)
+	}
+	if result.Status != brainapi.JobCompleted {
+		t.Fatalf("status = %q", result.Status)
+	}
+	events := spy.all()
+	if len(events) != 1 || events[0].Action != brainapi.ActionAdmin || events[0].Decision != audit.DecisionAllow {
+		t.Fatalf("audit events = %+v", events)
+	}
+
+	// Deny.
+	_, err = gw.AdminGetJob(ctx, AdminGetJobCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, TenantID: "tenant-1", JobID: "job-1"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member AdminGetJob kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid tenant ID.
+	_, err = gw.AdminGetJob(ctx, AdminGetJobCommand{Principal: admin, TenantID: "bad tenant", JobID: "job-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad tenant AdminGetJob kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid job ID.
+	_, err = gw.AdminGetJob(ctx, AdminGetJobCommand{Principal: admin, TenantID: "tenant-1", JobID: "bad job"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad job AdminGetJob kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayAdminListTenantsEmitsAuditEvents verifies deny audit for AdminListTenants.
+func TestGatewayAdminListTenantsEmitsAuditEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Deny: no admin role.
+	_, err = gw.AdminListTenants(ctx, AdminListTenantsCommand{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 1 || events[0].Decision != audit.DecisionDeny || events[0].Action != brainapi.ActionAdmin {
+		t.Fatalf("audit events = %+v", events)
+	}
+}
+
+// TestGatewayAdminListSourcesAndBindingsAudit verifies deny audit for list ops.
+func TestGatewayAdminListSourcesAndBindingsAudit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+	_, _ = gw.AdminListSources(ctx, AdminListSourcesCommand{Principal: member, TenantID: "tenant-1"})
+	_, _ = gw.AdminListBindings(ctx, AdminListBindingsCommand{Principal: member})
+	events := spy.all()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 audit events, got %d: %+v", len(events), events)
+	}
+	for _, e := range events {
+		if e.Decision != audit.DecisionDeny {
+			t.Errorf("expected deny, got %+v", e)
+		}
+	}
+}
+
+// TestGatewayAdminCoreErrors verifies that core errors after successful authorization
+// are propagated for AdminListTenants, AdminListBindings, and AdminListSources.
+func TestGatewayAdminCoreErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+
+	for _, tt := range []struct {
+		name string
+		call func(*Gateway) error
+	}{
+		{
+			name: "AdminListTenants core error",
+			call: func(gw *Gateway) error {
+				_, err := gw.AdminListTenants(ctx, AdminListTenantsCommand{Principal: admin})
+				return err
+			},
+		},
+		{
+			name: "AdminListBindings core error",
+			call: func(gw *Gateway) error {
+				_, err := gw.AdminListBindings(ctx, AdminListBindingsCommand{Principal: admin})
+				return err
+			},
+		},
+		{
+			name: "AdminListSources core error",
+			call: func(gw *Gateway) error {
+				_, err := gw.AdminListSources(ctx, AdminListSourcesCommand{Principal: admin, TenantID: "tenant-1"})
+				return err
+			},
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			errCore := newFakeCore()
+			errCore.adminErr = errors.New("core unavailable")
+			gw, err := New(errCore, RoleAuthorizer{}, jobs.NewStore())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			err = tt.call(gw)
+			if err == nil || err.Error() != "core unavailable" {
+				t.Fatalf("err = %v", err)
+			}
+		})
 	}
 }
 

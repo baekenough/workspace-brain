@@ -166,6 +166,84 @@ func TestDispatcherPropagatesGatewayErrors(t *testing.T) {
 	}
 }
 
+// TestDispatcherAdminListSubcommands covers all admin list and admin get subcommands.
+func TestDispatcherAdminListSubcommands(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	d := NewDispatcher(gw)
+	admin := brainapi.Principal{Source: "api", ID: "admin", Roles: []string{"admin"}}
+
+	for _, tt := range []struct {
+		name    string
+		text    string
+		want    string
+		wantErr bool
+	}{
+		{"list tenants", "admin list tenants", "테넌트 목록", false},
+		{"list bindings", "admin list bindings", "바인딩 목록", false},
+		{"list bindings tenant", "admin list bindings t1", "바인딩 목록", false},
+		{"list sources", "admin list sources t1", "소스 목록", false},
+		{"list jobs", "admin list jobs t1", "작업 목록", false},
+		{"get job", "admin get job t1 job-1", "작업 상태", false},
+		{"list sources missing tenant", "admin list sources", "", true},
+		{"list jobs missing tenant", "admin list jobs", "", true},
+		{"get job missing args", "admin get job t1", "", true},
+		{"get no sub", "admin get", "", true},
+		{"list no sub", "admin list", "", true},
+		{"list unknown sub", "admin list blah", "", true},
+		{"get unknown sub", "admin get blah", "", true},
+		// on/off without a tenant ID must return KindInvalid.
+		{"on missing tenant", "admin on", "", true},
+		{"off too many args", "admin off t1 t2", "", true},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			res, err := d.Handle(context.Background(), withText(Request{Principal: admin}, tt.text))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got response %+v", res)
+				}
+				if !brainapi.IsKind(err, brainapi.KindInvalid) {
+					t.Fatalf("expected KindInvalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if !strings.Contains(res.Text, tt.want) {
+				t.Fatalf("response %q does not contain %q", res.Text, tt.want)
+			}
+		})
+	}
+}
+
+// TestDispatcherAdminListGatewayErrors verifies that gateway errors from admin
+// list/get methods are propagated to the caller.
+func TestDispatcherAdminListGatewayErrors(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("gateway down")
+	d := NewDispatcher(&fakeGateway{err: boom})
+	admin := brainapi.Principal{Source: "api", ID: "admin", Roles: []string{"admin"}}
+	for _, text := range []string{
+		"admin list tenants",
+		"admin list bindings",
+		"admin list sources t1",
+		"admin list jobs t1",
+		"admin get job t1 job-1",
+	} {
+		text := text
+		t.Run(text, func(t *testing.T) {
+			t.Parallel()
+			_, err := d.Handle(context.Background(), withText(Request{Principal: admin}, text))
+			if err == nil || err.Error() != "gateway down" {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func withText(req Request, text string) Request {
 	req.Text = text
 	return req
@@ -237,6 +315,41 @@ func (f *fakeGateway) SetProjectState(_ context.Context, cmd gateway.SetProjectS
 		return gateway.SetProjectStateResult{}, f.err
 	}
 	return gateway.SetProjectStateResult{TenantID: cmd.TenantID, State: cmd.State}, nil
+}
+
+func (f *fakeGateway) AdminListTenants(_ context.Context, _ gateway.AdminListTenantsCommand) (gateway.AdminListTenantsResult, error) {
+	if f.err != nil {
+		return gateway.AdminListTenantsResult{}, f.err
+	}
+	return gateway.AdminListTenantsResult{Tenants: []brainapi.TenantInfo{{TenantID: "t1"}}}, nil
+}
+
+func (f *fakeGateway) AdminListBindings(_ context.Context, _ gateway.AdminListBindingsCommand) (gateway.AdminListBindingsResult, error) {
+	if f.err != nil {
+		return gateway.AdminListBindingsResult{}, f.err
+	}
+	return gateway.AdminListBindingsResult{Bindings: []brainapi.BindingInfo{{BindingKey: "api:space:S1", TenantID: "t1"}}}, nil
+}
+
+func (f *fakeGateway) AdminListSources(_ context.Context, _ gateway.AdminListSourcesCommand) (gateway.AdminListSourcesResult, error) {
+	if f.err != nil {
+		return gateway.AdminListSourcesResult{}, f.err
+	}
+	return gateway.AdminListSourcesResult{Sources: []brainapi.SourceInfo{{ID: "s1", TenantID: "t1", Name: "doc.pdf"}}}, nil
+}
+
+func (f *fakeGateway) AdminListJobs(_ context.Context, _ gateway.AdminListJobsCommand) (gateway.AdminListJobsResult, error) {
+	if f.err != nil {
+		return gateway.AdminListJobsResult{}, f.err
+	}
+	return gateway.AdminListJobsResult{Jobs: []brainapi.JobSnapshot{{TenantID: "t1", JobID: "job-1", Status: brainapi.JobRunning}}}, nil
+}
+
+func (f *fakeGateway) AdminGetJob(_ context.Context, _ gateway.AdminGetJobCommand) (brainapi.JobSnapshot, error) {
+	if f.err != nil {
+		return brainapi.JobSnapshot{}, f.err
+	}
+	return brainapi.JobSnapshot{TenantID: "t1", JobID: "job-1", Status: brainapi.JobCompleted}, nil
 }
 
 type userOnlyGateway struct{ base *fakeGateway }

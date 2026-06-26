@@ -426,6 +426,21 @@ func (f *demoCoreFake) Discover(context.Context, brainapi.DiscoverRequest) (brai
 func (f *demoCoreFake) SetProjectState(context.Context, brainapi.TenantID, brainapi.ProjectState) error {
 	return nil
 }
+func (f *demoCoreFake) AdminListTenants(context.Context, brainapi.AdminListTenantsRequest) (brainapi.AdminListTenantsResponse, error) {
+	return brainapi.AdminListTenantsResponse{}, nil
+}
+func (f *demoCoreFake) AdminListBindings(context.Context, brainapi.AdminListBindingsRequest) (brainapi.AdminListBindingsResponse, error) {
+	return brainapi.AdminListBindingsResponse{}, nil
+}
+func (f *demoCoreFake) AdminListSources(context.Context, brainapi.TenantID) (brainapi.AdminListSourcesResponse, error) {
+	return brainapi.AdminListSourcesResponse{}, nil
+}
+func (f *demoCoreFake) AdminListJobs(context.Context, brainapi.TenantID) (brainapi.AdminListJobsResponse, error) {
+	return brainapi.AdminListJobsResponse{}, nil
+}
+func (f *demoCoreFake) AdminGetJob(context.Context, brainapi.TenantID, brainapi.JobID) (brainapi.JobSnapshot, error) {
+	return brainapi.JobSnapshot{}, nil
+}
 
 type errWriter struct{}
 

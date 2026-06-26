@@ -232,9 +232,10 @@ type Core struct {
 }
 
 type project struct {
-	owner    brainapi.Principal
-	metadata map[string]string
-	state    brainapi.ProjectState
+	owner     brainapi.Principal
+	metadata  map[string]string
+	state     brainapi.ProjectState
+	createdAt time.Time
 }
 
 type document struct {
@@ -407,7 +408,7 @@ func (c *Core) CreateProject(ctx context.Context, req brainapi.CreateProjectRequ
 	if _, ok := c.bindings[req.BindingKey]; ok {
 		return brainapi.E(brainapi.KindAlreadyExists, "create_project", "binding already exists", nil)
 	}
-	c.projects[req.TenantID] = project{owner: req.OwnerPrincipal, metadata: cloneMap(req.Metadata), state: brainapi.ProjectOn}
+	c.projects[req.TenantID] = project{owner: req.OwnerPrincipal, metadata: cloneMap(req.Metadata), state: brainapi.ProjectOn, createdAt: c.now().UTC()}
 	c.bindings[req.BindingKey] = req.TenantID
 	if err := c.persistLocked(); err != nil {
 		delete(c.projects, req.TenantID)
@@ -639,6 +640,130 @@ func (c *Core) SetProjectState(ctx context.Context, tenantID brainapi.TenantID, 
 		return err
 	}
 	return nil
+}
+
+// ─── Admin read operations ────────────────────────────────────────────────────
+
+// AdminListTenants returns metadata summaries for all provisioned tenants.
+// It does not check project state and never requires a tenant GUC.
+func (c *Core) AdminListTenants(_ context.Context, _ brainapi.AdminListTenantsRequest) (brainapi.AdminListTenantsResponse, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("admin_list_tenants"); err != nil {
+		return brainapi.AdminListTenantsResponse{}, err
+	}
+	tenants := make([]brainapi.TenantInfo, 0, len(c.projects))
+	for id, proj := range c.projects {
+		tenants = append(tenants, brainapi.TenantInfo{
+			TenantID:  id,
+			State:     proj.state,
+			OwnerID:   proj.owner.ID,
+			CreatedAt: proj.createdAt,
+		})
+	}
+	sort.Slice(tenants, func(i, j int) bool {
+		return string(tenants[i].TenantID) < string(tenants[j].TenantID)
+	})
+	return brainapi.AdminListTenantsResponse{Tenants: tenants}, nil
+}
+
+// AdminListBindings returns binding summaries, optionally filtered by tenant.
+func (c *Core) AdminListBindings(_ context.Context, req brainapi.AdminListBindingsRequest) (brainapi.AdminListBindingsResponse, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("admin_list_bindings"); err != nil {
+		return brainapi.AdminListBindingsResponse{}, err
+	}
+	bindings := make([]brainapi.BindingInfo, 0, len(c.bindings))
+	for key, tid := range c.bindings {
+		if req.TenantID != "" && tid != req.TenantID {
+			continue
+		}
+		bindings = append(bindings, brainapi.BindingInfo{BindingKey: key, TenantID: tid})
+	}
+	sort.Slice(bindings, func(i, j int) bool {
+		return string(bindings[i].BindingKey) < string(bindings[j].BindingKey)
+	})
+	return brainapi.AdminListBindingsResponse{Bindings: bindings}, nil
+}
+
+// AdminListSources returns source metadata for a specific tenant without
+// checking project state. Chunk content is never returned.
+func (c *Core) AdminListSources(_ context.Context, tenantID brainapi.TenantID) (brainapi.AdminListSourcesResponse, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.AdminListSourcesResponse{}, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("admin_list_sources"); err != nil {
+		return brainapi.AdminListSourcesResponse{}, err
+	}
+	srcs := c.sources[tenantID]
+	docs := c.docs[tenantID]
+	infos := make([]brainapi.SourceInfo, 0, len(srcs))
+	for i, ref := range srcs {
+		name := ref.Name
+		if name == "" {
+			name = ref.URI
+		}
+		var freshAt time.Time
+		if i < len(docs) {
+			freshAt = docs[i].freshAt
+		}
+		infos = append(infos, brainapi.SourceInfo{
+			ID:        string(tenantID) + ":source:" + strconv.Itoa(i),
+			TenantID:  tenantID,
+			Name:      name,
+			URI:       ref.URI,
+			MimeType:  ref.MimeType,
+			CreatedAt: freshAt,
+		})
+	}
+	return brainapi.AdminListSourcesResponse{Sources: infos}, nil
+}
+
+// AdminListJobs returns job snapshots for a specific tenant without checking
+// project state.
+func (c *Core) AdminListJobs(_ context.Context, tenantID brainapi.TenantID) (brainapi.AdminListJobsResponse, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.AdminListJobsResponse{}, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("admin_list_jobs"); err != nil {
+		return brainapi.AdminListJobsResponse{}, err
+	}
+	prefix := string(tenantID) + "\x00"
+	var jobs []brainapi.JobSnapshot
+	for key, snap := range c.jobs {
+		if strings.HasPrefix(key, prefix) {
+			jobs = append(jobs, snap)
+		}
+	}
+	sort.Slice(jobs, func(i, j int) bool {
+		return string(jobs[i].JobID) < string(jobs[j].JobID)
+	})
+	return brainapi.AdminListJobsResponse{Jobs: jobs}, nil
+}
+
+// AdminGetJob returns a single job snapshot without checking project state.
+func (c *Core) AdminGetJob(_ context.Context, tenantID brainapi.TenantID, jobID brainapi.JobID) (brainapi.JobSnapshot, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	if err := brainapi.ValidateJobID(jobID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("admin_get_job"); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	snap, ok := c.jobs[jobKey(tenantID, jobID)]
+	if !ok {
+		return brainapi.JobSnapshot{}, brainapi.E(brainapi.KindNotFound, "admin_get_job", "job not found", nil)
+	}
+	return snap, nil
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────

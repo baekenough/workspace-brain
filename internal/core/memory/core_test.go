@@ -789,6 +789,99 @@ func TestCoreSourceIDsDistinctBeyond26Sources(t *testing.T) {
 	}
 }
 
+// TestCoreAdminListMultiItem covers sort comparison branches in admin methods
+// (only reachable when 2+ items exist) and the "name=="" source branch.
+func TestCoreAdminListMultiItem(t *testing.T) {
+	t.Parallel()
+	core := New()
+	ctx := context.Background()
+
+	// Two tenants — AdminListTenants sort comparison runs.
+	mustCreate(t, core, "tenant-z", "slack:channel:CZ")
+	mustCreate(t, core, "tenant-a", "slack:channel:CA")
+	tenants, err := core.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+	if err != nil {
+		t.Fatalf("AdminListTenants: %v", err)
+	}
+	if len(tenants.Tenants) < 2 || string(tenants.Tenants[0].TenantID) >= string(tenants.Tenants[1].TenantID) {
+		t.Fatalf("expected ascending order: %+v", tenants.Tenants)
+	}
+
+	// Two bindings across tenants — exercises sort comparison and the
+	// "binding doesn't match filter" skip branch in AdminListBindings.
+	bindings, err := core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{TenantID: "tenant-a"})
+	if err != nil {
+		t.Fatalf("AdminListBindings filtered: %v", err)
+	}
+	// Only tenant-a binding (slack:channel:CA) should be returned.
+	for _, b := range bindings.Bindings {
+		if b.TenantID != "tenant-a" {
+			t.Fatalf("expected only tenant-a, got %+v", b)
+		}
+	}
+
+	// Unfiltered list must contain both bindings and be sorted.
+	all, err := core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{})
+	if err != nil {
+		t.Fatalf("AdminListBindings all: %v", err)
+	}
+	if len(all.Bindings) < 2 {
+		t.Fatalf("expected 2+ bindings, got %+v", all.Bindings)
+	}
+	for i := 1; i < len(all.Bindings); i++ {
+		if string(all.Bindings[i-1].BindingKey) > string(all.Bindings[i].BindingKey) {
+			t.Fatalf("bindings not sorted: %+v", all.Bindings)
+		}
+	}
+
+	// Source with empty Name — exercises the "if name=="" branch.
+	if err := core.Ingest(ctx, brainapi.IngestRequest{
+		TenantID: "tenant-a", JobID: "job-nameless",
+		Source: brainapi.SourceRef{URI: "file://nameless.txt"},
+	}); err != nil {
+		t.Fatalf("Ingest nameless: %v", err)
+	}
+	srcs, err := core.AdminListSources(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("AdminListSources: %v", err)
+	}
+	var foundFallback bool
+	for _, s := range srcs.Sources {
+		if s.Name == "file://nameless.txt" { // URI used as fallback name
+			foundFallback = true
+		}
+	}
+	if !foundFallback {
+		t.Fatalf("expected nameless source to use URI as name: %+v", srcs.Sources)
+	}
+
+	// Two jobs — AdminListJobs sort comparison runs.
+	if err := core.Ingest(ctx, brainapi.IngestRequest{
+		TenantID: "tenant-a", JobID: "job-beta",
+		Source: brainapi.SourceRef{URI: "file://b.txt"},
+	}); err != nil {
+		t.Fatalf("Ingest job-beta: %v", err)
+	}
+	if err := core.Ingest(ctx, brainapi.IngestRequest{
+		TenantID: "tenant-a", JobID: "job-alpha",
+		Source: brainapi.SourceRef{URI: "file://a.txt"},
+	}); err != nil {
+		t.Fatalf("Ingest job-alpha: %v", err)
+	}
+	jobs, err := core.AdminListJobs(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("AdminListJobs: %v", err)
+	}
+	if len(jobs.Jobs) < 2 {
+		t.Fatalf("expected 2+ jobs: %+v", jobs.Jobs)
+	}
+	for i := 1; i < len(jobs.Jobs); i++ {
+		if string(jobs.Jobs[i-1].JobID) > string(jobs.Jobs[i].JobID) {
+			t.Fatalf("jobs not sorted: %+v", jobs.Jobs)
+		}
+	}
+}
+
 func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
 	t.Parallel()
 	core := New()
@@ -842,6 +935,41 @@ func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
 			name: "set project state",
 			call: func() error {
 				return core.SetProjectState(ctx, "tenant-a", brainapi.ProjectOn)
+			},
+		},
+		{
+			name: "admin list tenants",
+			call: func() error {
+				_, err := core.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+				return err
+			},
+		},
+		{
+			name: "admin list bindings",
+			call: func() error {
+				_, err := core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{})
+				return err
+			},
+		},
+		{
+			name: "admin list sources",
+			call: func() error {
+				_, err := core.AdminListSources(ctx, "tenant-a")
+				return err
+			},
+		},
+		{
+			name: "admin list jobs",
+			call: func() error {
+				_, err := core.AdminListJobs(ctx, "tenant-a")
+				return err
+			},
+		},
+		{
+			name: "admin get job",
+			call: func() error {
+				_, err := core.AdminGetJob(ctx, "tenant-a", "job-1")
+				return err
 			},
 		},
 	}

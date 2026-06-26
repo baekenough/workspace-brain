@@ -347,6 +347,140 @@ func (g *Gateway) SetProjectState(ctx context.Context, cmd SetProjectStateComman
 	return SetProjectStateResult{TenantID: cmd.TenantID, State: cmd.State}, nil
 }
 
+// AdminListTenantsCommand asks the gateway to enumerate all provisioned tenants.
+type AdminListTenantsCommand struct {
+	Principal brainapi.Principal
+}
+
+// AdminListTenantsResult wraps the core response for the admin surface.
+type AdminListTenantsResult struct {
+	Tenants []brainapi.TenantInfo
+}
+
+// AdminListTenants authorizes an admin principal and returns all tenant summaries.
+func (g *Gateway) AdminListTenants(ctx context.Context, cmd AdminListTenantsCommand) (AdminListTenantsResult, error) {
+	const op = "gateway_admin_list_tenants"
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, "", authErr)
+	if authErr != nil {
+		return AdminListTenantsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+	if err != nil {
+		return AdminListTenantsResult{}, err
+	}
+	return AdminListTenantsResult{Tenants: resp.Tenants}, nil
+}
+
+// AdminListBindingsCommand asks the gateway to enumerate bindings.
+// When TenantID is non-empty only bindings for that tenant are returned.
+type AdminListBindingsCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID // empty = all tenants
+}
+
+// AdminListBindingsResult wraps the core response.
+type AdminListBindingsResult struct {
+	Bindings []brainapi.BindingInfo
+}
+
+// AdminListBindings authorizes an admin principal and returns binding summaries.
+func (g *Gateway) AdminListBindings(ctx context.Context, cmd AdminListBindingsCommand) (AdminListBindingsResult, error) {
+	const op = "gateway_admin_list_bindings"
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListBindingsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{TenantID: cmd.TenantID})
+	if err != nil {
+		return AdminListBindingsResult{}, err
+	}
+	return AdminListBindingsResult{Bindings: resp.Bindings}, nil
+}
+
+// AdminListSourcesCommand asks for source metadata for a specific tenant.
+type AdminListSourcesCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+}
+
+// AdminListSourcesResult wraps the core response (no chunk content).
+type AdminListSourcesResult struct {
+	Sources []brainapi.SourceInfo
+}
+
+// AdminListSources authorizes and returns source metadata (no chunk content).
+func (g *Gateway) AdminListSources(ctx context.Context, cmd AdminListSourcesCommand) (AdminListSourcesResult, error) {
+	const op = "gateway_admin_list_sources"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return AdminListSourcesResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListSourcesResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListSources(ctx, cmd.TenantID)
+	if err != nil {
+		return AdminListSourcesResult{}, err
+	}
+	return AdminListSourcesResult{Sources: resp.Sources}, nil
+}
+
+// AdminListJobsCommand asks for job snapshots for a specific tenant.
+type AdminListJobsCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+}
+
+// AdminListJobsResult wraps the core response.
+type AdminListJobsResult struct {
+	Jobs []brainapi.JobSnapshot
+}
+
+// AdminListJobs authorizes and returns job snapshots for a tenant.
+func (g *Gateway) AdminListJobs(ctx context.Context, cmd AdminListJobsCommand) (AdminListJobsResult, error) {
+	const op = "gateway_admin_list_jobs"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return AdminListJobsResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListJobsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListJobs(ctx, cmd.TenantID)
+	if err != nil {
+		return AdminListJobsResult{}, err
+	}
+	return AdminListJobsResult{Jobs: resp.Jobs}, nil
+}
+
+// AdminGetJobCommand asks for a single job snapshot.
+type AdminGetJobCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+	JobID     brainapi.JobID
+}
+
+// AdminGetJob authorizes and returns a single job snapshot.
+func (g *Gateway) AdminGetJob(ctx context.Context, cmd AdminGetJobCommand) (brainapi.JobSnapshot, error) {
+	const op = "gateway_admin_get_job"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	if err := brainapi.ValidateJobID(cmd.JobID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return brainapi.JobSnapshot{}, brainapi.SafeAccessError(op)
+	}
+	return g.core.AdminGetJob(ctx, cmd.TenantID, cmd.JobID)
+}
+
 // HandleJobCompleted applies a core callback to the control-plane store.
 func (g *Gateway) HandleJobCompleted(ctx context.Context, tenantID brainapi.TenantID, jobID brainapi.JobID, status brainapi.JobStatus, resultRef string, message string) (brainapi.JobSnapshot, error) {
 	_ = ctx

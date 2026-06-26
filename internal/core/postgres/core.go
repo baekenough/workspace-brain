@@ -558,6 +558,219 @@ func (c *Core) SetProjectState(ctx context.Context, tenantID brainapi.TenantID, 
 	return nil
 }
 
+// ─── Admin read operations ────────────────────────────────────────────────────
+
+// AdminListTenants returns metadata summaries for all provisioned tenants.
+// It uses the admin GUC sentinel so RLS does not filter the result set.
+func (c *Core) AdminListTenants(ctx context.Context, _ brainapi.AdminListTenantsRequest) (brainapi.AdminListTenantsResponse, error) {
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return brainapi.AdminListTenantsResponse{}, wrapInternal("admin_list_tenants", err)
+	}
+	defer conn.Release()
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return brainapi.AdminListTenantsResponse{}, wrapInternal("admin_list_tenants", err)
+	}
+	rows, err := conn.Query(ctx,
+		`SELECT tenant_id, state, owner_id, created_at FROM tenants ORDER BY tenant_id`,
+	)
+	if err != nil {
+		return brainapi.AdminListTenantsResponse{}, wrapInternal("admin_list_tenants", err)
+	}
+	defer rows.Close()
+	var tenants []brainapi.TenantInfo
+	for rows.Next() {
+		var tidStr, stateStr, ownerIDStr string
+		var createdAt time.Time
+		if err := rows.Scan(&tidStr, &stateStr, &ownerIDStr, &createdAt); err != nil {
+			return brainapi.AdminListTenantsResponse{}, wrapInternal("admin_list_tenants", err)
+		}
+		tenants = append(tenants, brainapi.TenantInfo{
+			TenantID:  brainapi.TenantID(tidStr),
+			State:     brainapi.ProjectState(stateStr),
+			OwnerID:   ownerIDStr,
+			CreatedAt: createdAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return brainapi.AdminListTenantsResponse{}, wrapInternal("admin_list_tenants", err)
+	}
+	return brainapi.AdminListTenantsResponse{Tenants: tenants}, nil
+}
+
+// AdminListBindings returns binding summaries, optionally filtered by tenant.
+// Uses the admin GUC sentinel so RLS does not restrict visibility.
+func (c *Core) AdminListBindings(ctx context.Context, req brainapi.AdminListBindingsRequest) (brainapi.AdminListBindingsResponse, error) {
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return brainapi.AdminListBindingsResponse{}, wrapInternal("admin_list_bindings", err)
+	}
+	defer conn.Release()
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return brainapi.AdminListBindingsResponse{}, wrapInternal("admin_list_bindings", err)
+	}
+	var rows pgx.Rows
+	if req.TenantID != "" {
+		rows, err = conn.Query(ctx,
+			`SELECT binding_key, tenant_id FROM bindings WHERE tenant_id = $1 ORDER BY binding_key`,
+			string(req.TenantID),
+		)
+	} else {
+		rows, err = conn.Query(ctx,
+			`SELECT binding_key, tenant_id FROM bindings ORDER BY binding_key`,
+		)
+	}
+	if err != nil {
+		return brainapi.AdminListBindingsResponse{}, wrapInternal("admin_list_bindings", err)
+	}
+	defer rows.Close()
+	var bindings []brainapi.BindingInfo
+	for rows.Next() {
+		var keyStr, tidStr string
+		if err := rows.Scan(&keyStr, &tidStr); err != nil {
+			return brainapi.AdminListBindingsResponse{}, wrapInternal("admin_list_bindings", err)
+		}
+		bindings = append(bindings, brainapi.BindingInfo{
+			BindingKey: brainapi.BindingKey(keyStr),
+			TenantID:   brainapi.TenantID(tidStr),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return brainapi.AdminListBindingsResponse{}, wrapInternal("admin_list_bindings", err)
+	}
+	return brainapi.AdminListBindingsResponse{Bindings: bindings}, nil
+}
+
+// AdminListSources returns source metadata for a specific tenant (no chunk
+// content) using the admin GUC sentinel; project state is not checked.
+func (c *Core) AdminListSources(ctx context.Context, tenantID brainapi.TenantID) (brainapi.AdminListSourcesResponse, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.AdminListSourcesResponse{}, err
+	}
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return brainapi.AdminListSourcesResponse{}, wrapInternal("admin_list_sources", err)
+	}
+	defer conn.Release()
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return brainapi.AdminListSourcesResponse{}, wrapInternal("admin_list_sources", err)
+	}
+	rows, err := conn.Query(ctx,
+		`SELECT id, uri, name, mime_type, created_at FROM sources WHERE tenant_id = $1 ORDER BY id`,
+		string(tenantID),
+	)
+	if err != nil {
+		return brainapi.AdminListSourcesResponse{}, wrapInternal("admin_list_sources", err)
+	}
+	defer rows.Close()
+	var sources []brainapi.SourceInfo
+	for rows.Next() {
+		var id int64
+		var uri, name, mimeType string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &uri, &name, &mimeType, &createdAt); err != nil {
+			return brainapi.AdminListSourcesResponse{}, wrapInternal("admin_list_sources", err)
+		}
+		sources = append(sources, brainapi.SourceInfo{
+			ID:        string(tenantID) + ":source:" + strconv.FormatInt(id, 10),
+			TenantID:  tenantID,
+			URI:       uri,
+			Name:      name,
+			MimeType:  mimeType,
+			CreatedAt: createdAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return brainapi.AdminListSourcesResponse{}, wrapInternal("admin_list_sources", err)
+	}
+	return brainapi.AdminListSourcesResponse{Sources: sources}, nil
+}
+
+// AdminListJobs returns job snapshots for a specific tenant using the admin
+// GUC sentinel; project state is not checked.
+func (c *Core) AdminListJobs(ctx context.Context, tenantID brainapi.TenantID) (brainapi.AdminListJobsResponse, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.AdminListJobsResponse{}, err
+	}
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return brainapi.AdminListJobsResponse{}, wrapInternal("admin_list_jobs", err)
+	}
+	defer conn.Release()
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return brainapi.AdminListJobsResponse{}, wrapInternal("admin_list_jobs", err)
+	}
+	rows, err := conn.Query(ctx,
+		`SELECT job_id, status, result_ref, error, updated_at
+		 FROM jobs WHERE tenant_id = $1 ORDER BY job_id`,
+		string(tenantID),
+	)
+	if err != nil {
+		return brainapi.AdminListJobsResponse{}, wrapInternal("admin_list_jobs", err)
+	}
+	defer rows.Close()
+	var jobs []brainapi.JobSnapshot
+	for rows.Next() {
+		var jobIDStr, status, resultRef, jobErr string
+		var updatedAt time.Time
+		if err := rows.Scan(&jobIDStr, &status, &resultRef, &jobErr, &updatedAt); err != nil {
+			return brainapi.AdminListJobsResponse{}, wrapInternal("admin_list_jobs", err)
+		}
+		jobs = append(jobs, brainapi.JobSnapshot{
+			TenantID:  tenantID,
+			JobID:     brainapi.JobID(jobIDStr),
+			Status:    brainapi.JobStatus(status),
+			ResultRef: resultRef,
+			Error:     jobErr,
+			UpdatedAt: updatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return brainapi.AdminListJobsResponse{}, wrapInternal("admin_list_jobs", err)
+	}
+	return brainapi.AdminListJobsResponse{Jobs: jobs}, nil
+}
+
+// AdminGetJob returns a single job snapshot using the admin GUC sentinel;
+// project state is not checked.
+func (c *Core) AdminGetJob(ctx context.Context, tenantID brainapi.TenantID, jobID brainapi.JobID) (brainapi.JobSnapshot, error) {
+	if err := brainapi.ValidateTenantID(tenantID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	if err := brainapi.ValidateJobID(jobID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return brainapi.JobSnapshot{}, wrapInternal("admin_get_job", err)
+	}
+	defer conn.Release()
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return brainapi.JobSnapshot{}, wrapInternal("admin_get_job", err)
+	}
+	var status, resultRef, jobErr string
+	var updatedAt time.Time
+	err = conn.QueryRow(ctx,
+		`SELECT status, result_ref, error, updated_at
+		 FROM jobs WHERE tenant_id = $1 AND job_id = $2`,
+		string(tenantID), string(jobID),
+	).Scan(&status, &resultRef, &jobErr, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return brainapi.JobSnapshot{}, brainapi.E(brainapi.KindNotFound, "admin_get_job", "job not found", nil)
+	}
+	if err != nil {
+		return brainapi.JobSnapshot{}, wrapInternal("admin_get_job", err)
+	}
+	return brainapi.JobSnapshot{
+		TenantID:  tenantID,
+		JobID:     jobID,
+		Status:    brainapi.JobStatus(status),
+		ResultRef: resultRef,
+		Error:     jobErr,
+		UpdatedAt: updatedAt,
+	}, nil
+}
+
 // ─── GUC helpers ─────────────────────────────────────────────────────────────
 
 // setTenantGUC sets app.tenant_id on the connection so that all subsequent

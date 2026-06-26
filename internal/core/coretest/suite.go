@@ -480,4 +480,280 @@ func RunContractSuite(t *testing.T, newCore func() brainapi.Core) {
 			t.Fatalf("missing source URI: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
 		}
 	})
+
+	// ─── Admin read operations ────────────────────────────────────────────────
+
+	t.Run("admin_list_tenants_includes_created", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-lt-tenant"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CADLT",
+			OwnerPrincipal: brainapi.Principal{ID: "owner-admin-lt"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		resp, err := core.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+		if err != nil {
+			t.Fatalf("AdminListTenants: %v", err)
+		}
+		var found *brainapi.TenantInfo
+		for i := range resp.Tenants {
+			if resp.Tenants[i].TenantID == tenantID {
+				found = &resp.Tenants[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("tenant %q not found in AdminListTenants: %+v", tenantID, resp.Tenants)
+		}
+		if found.State != brainapi.ProjectOn {
+			t.Fatalf("state = %q, want on", found.State)
+		}
+		if found.OwnerID != "owner-admin-lt" {
+			t.Fatalf("ownerID = %q, want owner-admin-lt", found.OwnerID)
+		}
+	})
+
+	t.Run("admin_list_bindings_filtered_by_tenant", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-lb-tenant"
+		const bindingKey brainapi.BindingKey = "api:space:CADLB"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     bindingKey,
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		resp, err := core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{TenantID: tenantID})
+		if err != nil {
+			t.Fatalf("AdminListBindings: %v", err)
+		}
+		if len(resp.Bindings) != 1 {
+			t.Fatalf("expected 1 binding for tenant, got %d: %+v", len(resp.Bindings), resp.Bindings)
+		}
+		if resp.Bindings[0].BindingKey != bindingKey || resp.Bindings[0].TenantID != tenantID {
+			t.Fatalf("binding mismatch: %+v", resp.Bindings[0])
+		}
+	})
+
+	t.Run("admin_list_bindings_unfiltered_includes_created", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const bindingKey brainapi.BindingKey = "api:space:CADLBU"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-admin-lbu-tenant",
+			BindingKey:     bindingKey,
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		resp, err := core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{})
+		if err != nil {
+			t.Fatalf("AdminListBindings unfiltered: %v", err)
+		}
+		found := false
+		for _, b := range resp.Bindings {
+			if b.BindingKey == bindingKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("binding %q not found in unfiltered list: %+v", bindingKey, resp.Bindings)
+		}
+	})
+
+	t.Run("admin_list_sources_metadata_only", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-ls-tenant"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CADLS",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: tenantID,
+			JobID:    "contract-admin-ls-job",
+			Source:   brainapi.SourceRef{URI: "file://admin-source.txt", Name: "admin-source.txt"},
+			Metadata: map[string]string{"content": "admin source content"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		resp, err := core.AdminListSources(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("AdminListSources: %v", err)
+		}
+		if len(resp.Sources) != 1 {
+			t.Fatalf("expected 1 source, got %d", len(resp.Sources))
+		}
+		src := resp.Sources[0]
+		if src.TenantID != tenantID {
+			t.Fatalf("source TenantID = %q, want %q", src.TenantID, tenantID)
+		}
+		if src.Name != "admin-source.txt" {
+			t.Fatalf("source Name = %q, want admin-source.txt", src.Name)
+		}
+		if src.URI == "" {
+			t.Fatalf("source URI is empty")
+		}
+		if src.ID == "" {
+			t.Fatalf("source ID is empty")
+		}
+	})
+
+	t.Run("admin_list_sources_works_when_project_off", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-ls-off-tenant"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CADLSOFF",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: tenantID,
+			JobID:    "contract-admin-ls-off-job",
+			Source:   brainapi.SourceRef{URI: "file://off-source.txt", Name: "off-source.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		if err := core.SetProjectState(ctx, tenantID, brainapi.ProjectOff); err != nil {
+			t.Fatalf("SetProjectState Off: %v", err)
+		}
+		// Admin read must bypass "project is off" check.
+		resp, err := core.AdminListSources(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("AdminListSources on off project: %v", err)
+		}
+		if len(resp.Sources) != 1 {
+			t.Fatalf("expected 1 source, got %d", len(resp.Sources))
+		}
+	})
+
+	t.Run("admin_list_sources_invalid_tenant", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		_, err := core.AdminListSources(ctx, "bad tenant id")
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid tenant: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("admin_list_jobs_and_get_job", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-lj-tenant"
+		const jobID brainapi.JobID = "contract-admin-lj-job"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CADLJ",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: tenantID,
+			JobID:    jobID,
+			Source:   brainapi.SourceRef{URI: "file://job-source.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		listResp, err := core.AdminListJobs(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("AdminListJobs: %v", err)
+		}
+		if len(listResp.Jobs) != 1 {
+			t.Fatalf("expected 1 job, got %d", len(listResp.Jobs))
+		}
+		if listResp.Jobs[0].JobID != jobID || listResp.Jobs[0].TenantID != tenantID {
+			t.Fatalf("job mismatch: %+v", listResp.Jobs[0])
+		}
+		snap, err := core.AdminGetJob(ctx, tenantID, jobID)
+		if err != nil {
+			t.Fatalf("AdminGetJob: %v", err)
+		}
+		if snap.JobID != jobID || snap.TenantID != tenantID {
+			t.Fatalf("snapshot mismatch: %+v", snap)
+		}
+		if snap.Status != brainapi.JobRunning {
+			t.Fatalf("status = %q, want running", snap.Status)
+		}
+	})
+
+	t.Run("admin_get_job_not_found", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       "contract-admin-gj-nf-tenant",
+			BindingKey:     "api:space:CADGJNF",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		_, err := core.AdminGetJob(ctx, "contract-admin-gj-nf-tenant", "nonexistent-job")
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("want NotFound, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("admin_list_jobs_works_when_project_off", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-admin-lj-off-tenant"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CADLJOFF",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: tenantID,
+			JobID:    "contract-admin-lj-off-job",
+			Source:   brainapi.SourceRef{URI: "file://off-job-source.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		if err := core.SetProjectState(ctx, tenantID, brainapi.ProjectOff); err != nil {
+			t.Fatalf("SetProjectState Off: %v", err)
+		}
+		listResp, err := core.AdminListJobs(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("AdminListJobs on off project: %v", err)
+		}
+		if len(listResp.Jobs) != 1 {
+			t.Fatalf("expected 1 job, got %d: %+v", len(listResp.Jobs), listResp.Jobs)
+		}
+	})
+
+	t.Run("admin_list_jobs_invalid_tenant", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		_, err := core.AdminListJobs(ctx, "bad tenant id")
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid tenant: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("admin_get_job_invalid_inputs", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		_, err := core.AdminGetJob(ctx, "bad tenant id", "job-1")
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid tenant: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		_, err = core.AdminGetJob(ctx, "valid-tenant", "bad job id")
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("invalid job id: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
 }
