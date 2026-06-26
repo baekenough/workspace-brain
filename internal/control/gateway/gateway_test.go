@@ -3,13 +3,35 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/sangyi/workspace-brain/internal/control/audit"
 	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
+
+// spyAuditLogger records all emitted audit events for assertion in tests.
+type spyAuditLogger struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (s *spyAuditLogger) Log(e audit.Event) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, e)
+}
+
+func (s *spyAuditLogger) all() []audit.Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]audit.Event, len(s.events))
+	copy(out, s.events)
+	return out
+}
 
 func TestGatewayCreateProjectUsesGeneratedTenantAndOwner(t *testing.T) {
 	t.Parallel()
@@ -643,4 +665,167 @@ func (f fakeSourceLoader) Load(context.Context, brainapi.SourceRef, map[string]s
 		return sources.LoadedSource{}, f.err
 	}
 	return f.loaded, nil
+}
+
+// ── Audit logger tests ────────────────────────────────────────────────────────
+
+// TestWithAuditLoggerNilIsIgnored verifies that passing nil to WithAuditLogger
+// leaves the default no-op logger in place and does not cause a nil-pointer panic.
+func TestWithAuditLoggerNilIsIgnored(t *testing.T) {
+	t.Parallel()
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(nil))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// The no-op default should handle all auth paths without panicking.
+	_, err = gw.CreateProject(context.Background(), CreateProjectCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{ID: "admin", Roles: []string{"admin"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateProject with nil audit logger: %v", err)
+	}
+}
+
+// TestWithAuditLoggerSetsLogger verifies that WithAuditLogger installs the
+// provided logger and that it receives events for CreateProject.
+func TestWithAuditLoggerSetsLogger(t *testing.T) {
+	t.Parallel()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(),
+		WithTenantIDGenerator(staticTenantID("tenant-audit")),
+		WithAuditLogger(spy),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = gw.CreateProject(context.Background(), CreateProjectCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{Source: "slack", ID: "admin", Roles: []string{"admin"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 audit event, got %d", len(events))
+	}
+	e := events[0]
+	if e.Action != brainapi.ActionCreateProject {
+		t.Errorf("action = %q, want %q", e.Action, brainapi.ActionCreateProject)
+	}
+	if e.Decision != audit.DecisionAllow {
+		t.Errorf("decision = %q, want allow", e.Decision)
+	}
+	if e.Actor != "slack:admin" {
+		t.Errorf("actor = %q, want slack:admin", e.Actor)
+	}
+}
+
+// TestAuditLoggerRecordsDenyOnUnauthorizedCreateProject verifies that a denied
+// CreateProject emits a DecisionDeny event before returning SafeAccessError.
+func TestAuditLoggerRecordsDenyOnUnauthorizedCreateProject(t *testing.T) {
+	t.Parallel()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = gw.CreateProject(context.Background(), CreateProjectCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{ID: "member", Roles: []string{"member"}},
+	})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized, got: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 audit event, got %d", len(events))
+	}
+	if events[0].Decision != audit.DecisionDeny {
+		t.Errorf("decision = %q, want deny", events[0].Decision)
+	}
+}
+
+// TestAuditLoggerEmitsOnSetProjectState verifies allow and deny events from
+// SetProjectState, covering both branches of emitAuthAudit.
+func TestAuditLoggerEmitsOnSetProjectState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Allow path.
+	allowSpy := &spyAuditLogger{}
+	gwAllow, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(allowSpy))
+	if err != nil {
+		t.Fatalf("New allow: %v", err)
+	}
+	_, err = gwAllow.SetProjectState(ctx, SetProjectStateCommand{
+		TenantID:  "tenant-1",
+		State:     brainapi.ProjectOff,
+		Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}},
+	})
+	if err != nil {
+		t.Fatalf("SetProjectState allow: %v", err)
+	}
+	if ae := allowSpy.all(); len(ae) != 1 || ae[0].Decision != audit.DecisionAllow {
+		t.Errorf("allow audit events: %+v", ae)
+	}
+
+	// Deny path.
+	denySpy := &spyAuditLogger{}
+	gwDeny, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(denySpy))
+	if err != nil {
+		t.Fatalf("New deny: %v", err)
+	}
+	_, err = gwDeny.SetProjectState(ctx, SetProjectStateCommand{
+		TenantID:  "tenant-1",
+		State:     brainapi.ProjectOn,
+		Principal: brainapi.Principal{ID: "member", Roles: []string{"member"}},
+	})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized, got: %v", err)
+	}
+	if de := denySpy.all(); len(de) != 1 || de[0].Decision != audit.DecisionDeny {
+		t.Errorf("deny audit events: %+v", de)
+	}
+}
+
+// TestAuditLoggerEmitsOnResolveAndAuthorize verifies that the shared
+// resolveAndAuthorize path (used by Ask/Discover/Ingest/Status) emits events.
+func TestAuditLoggerEmitsOnResolveAndAuthorize(t *testing.T) {
+	t.Parallel()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+
+	// Allow: member query.
+	_, err = gw.Ask(ctx, AskCommand{BindingKey: "slack:channel:C1", Principal: member, Question: "q"})
+	if err != nil {
+		t.Fatalf("Ask: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event after Ask, got %d", len(events))
+	}
+	if events[0].Decision != audit.DecisionAllow || events[0].Action != brainapi.ActionQuery {
+		t.Errorf("event = %+v", events[0])
+	}
+
+	// Deny: principal without any role.
+	noRole := brainapi.Principal{ID: "U99"}
+	_, err = gw.Ask(ctx, AskCommand{BindingKey: "slack:channel:C1", Principal: noRole, Question: "q"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized, got: %v", err)
+	}
+	events = spy.all()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events total, got %d", len(events))
+	}
+	if events[1].Decision != audit.DecisionDeny {
+		t.Errorf("second event decision = %q, want deny", events[1].Decision)
+	}
 }

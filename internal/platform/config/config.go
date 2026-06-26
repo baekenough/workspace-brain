@@ -18,16 +18,22 @@ type Config struct {
 	APIToken           string
 	SlackSigningSecret string
 	AdminUsers         []string
-	PublicBaseURL      string
-	CommandName        string
-	SlackAppName       string
-	DataPath           string
-	ReadinessRequired  bool
-	ReadHeaderTimeout  time.Duration
-	ReadTimeout        time.Duration
-	WriteTimeout       time.Duration
-	IdleTimeout        time.Duration
-	ShutdownTimeout    time.Duration
+	// CreateAllowUsers is an optional allowlist of principal identifiers that
+	// may create projects without holding the "admin" role. It mirrors
+	// AdminUsers and is populated from CREATE_ALLOW_USERS (comma-separated).
+	// The gateway's PolicyAuthorizer matches entries against both the full
+	// principal key (source:id) and the raw id.
+	CreateAllowUsers  []string
+	PublicBaseURL     string
+	CommandName       string
+	SlackAppName      string
+	DataPath          string
+	ReadinessRequired bool
+	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ShutdownTimeout   time.Duration
 	// OpenAI embedding fields — all optional. When OpenAIAPIKey and
 	// OpenAIEmbeddingModel are both non-empty the server uses the
 	// OpenAI-backed embedder; otherwise the local FNV embedder is used.
@@ -59,6 +65,7 @@ func FromEnv(getenv LookupFunc) (Config, error) {
 		APIToken:             strings.TrimSpace(getenv("API_TOKEN")),
 		SlackSigningSecret:   strings.TrimSpace(getenv("SLACK_SIGNING_SECRET")),
 		AdminUsers:           splitList(getenv("ADMIN_USERS")),
+		CreateAllowUsers:     splitList(getenv("CREATE_ALLOW_USERS")),
 		PublicBaseURL:        strings.TrimRight(strings.TrimSpace(getenv("PUBLIC_BASE_URL")), "/"),
 		CommandName:          envOr(getenv, "COMMAND_NAME", defaultCommandName),
 		SlackAppName:         envOr(getenv, "SLACK_APP_NAME", defaultSlackAppName),
@@ -135,6 +142,16 @@ func (c Config) AdminUserSet() map[string]bool {
 		admins[user] = true
 	}
 	return admins
+}
+
+// CreateAllowlistSet returns the create allowlist as a lookup map for the
+// gateway's PolicyAuthorizer, mirroring the AdminUserSet pattern.
+func (c Config) CreateAllowlistSet() map[string]bool {
+	set := make(map[string]bool, len(c.CreateAllowUsers))
+	for _, user := range c.CreateAllowUsers {
+		set[user] = true
+	}
+	return set
 }
 
 func envOr(getenv LookupFunc, key, fallback string) string {

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 
+	"github.com/sangyi/workspace-brain/internal/control/audit"
 	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
@@ -44,6 +45,7 @@ type Gateway struct {
 	jobIDs     JobIDGenerator
 	loader     sources.SourceLoader
 	queue      ingest.Queue // optional async completion worker; nil = sync path
+	audit      audit.Logger // defaults to audit.NoOp{}
 }
 
 // Option configures a Gateway.
@@ -72,6 +74,17 @@ func WithSourceLoader(loader sources.SourceLoader) Option {
 	return func(g *Gateway) {
 		if loader != nil {
 			g.loader = loader
+		}
+	}
+}
+
+// WithAuditLogger sets the audit logger used to record authorization decisions.
+// Passing nil is a no-op: the default audit.NoOp logger is preserved so that
+// existing behaviour and tests remain unchanged.
+func WithAuditLogger(logger audit.Logger) Option {
+	return func(g *Gateway) {
+		if logger != nil {
+			g.audit = logger
 		}
 	}
 }
@@ -112,6 +125,7 @@ func New(core brainapi.Core, authorizer Authorizer, jobStore *jobs.Store, opts .
 		jobs:       jobStore,
 		tenantIDs:  &randTenantIDGenerator{},
 		jobIDs:     &randJobIDGenerator{},
+		audit:      audit.NoOp{},
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -131,6 +145,23 @@ type CreateProjectResult struct {
 	TenantID brainapi.TenantID
 }
 
+// emitAuthAudit records an authorization decision to the gateway's audit logger.
+func (g *Gateway) emitAuthAudit(actor string, action brainapi.Action, tenantID brainapi.TenantID, authErr error) {
+	decision := audit.DecisionAllow
+	reason := ""
+	if authErr != nil {
+		decision = audit.DecisionDeny
+		reason = authErr.Error()
+	}
+	g.audit.Log(audit.Event{
+		Actor:    actor,
+		Action:   action,
+		TenantID: tenantID,
+		Decision: decision,
+		Reason:   reason,
+	})
+}
+
 // CreateProject authorizes creation, generates tenant_id, and calls core provisioning.
 func (g *Gateway) CreateProject(ctx context.Context, cmd CreateProjectCommand) (CreateProjectResult, error) {
 	const op = "gateway_create_project"
@@ -140,7 +171,9 @@ func (g *Gateway) CreateProject(ctx context.Context, cmd CreateProjectCommand) (
 	if cmd.Principal.ID == "" {
 		return CreateProjectResult{}, brainapi.E(brainapi.KindInvalid, op, "principal is required", nil)
 	}
-	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, BindingKey: cmd.BindingKey, Action: brainapi.ActionCreateProject}); err != nil {
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, BindingKey: cmd.BindingKey, Action: brainapi.ActionCreateProject})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionCreateProject, "", authErr)
+	if authErr != nil {
 		return CreateProjectResult{}, brainapi.SafeAccessError(op)
 	}
 	tenantID := g.tenantIDs.NewTenantID()
@@ -300,7 +333,9 @@ func (g *Gateway) SetProjectState(ctx context.Context, cmd SetProjectStateComman
 	if cmd.State != brainapi.ProjectOn && cmd.State != brainapi.ProjectOff {
 		return SetProjectStateResult{}, brainapi.E(brainapi.KindInvalid, op, "unknown project state", nil)
 	}
-	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin}); err != nil {
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
 		return SetProjectStateResult{}, brainapi.SafeAccessError(op)
 	}
 	if err := g.core.SetProjectState(ctx, cmd.TenantID, cmd.State); err != nil {
@@ -335,7 +370,9 @@ func (g *Gateway) resolveAndAuthorize(ctx context.Context, binding brainapi.Bind
 		}
 		return "", err
 	}
-	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: principal, TenantID: tenantID, BindingKey: binding, Action: action}); err != nil {
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: principal, TenantID: tenantID, BindingKey: binding, Action: action})
+	g.emitAuthAudit(principal.Key(), action, tenantID, authErr)
+	if authErr != nil {
 		return "", brainapi.SafeAccessError(op)
 	}
 	return tenantID, nil

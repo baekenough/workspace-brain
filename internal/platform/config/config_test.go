@@ -174,6 +174,49 @@ func TestFromEnvOpenAIFieldsDefaultToEmpty(t *testing.T) {
 	}
 }
 
+func TestFromEnvParsesCreateAllowUsers(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "CREATE_ALLOW_USERS":
+			return " alice, bob, alice ,, "
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if got := strings.Join(cfg.CreateAllowUsers, ","); got != "alice,bob" {
+		t.Fatalf("CreateAllowUsers = %q", got)
+	}
+	set := cfg.CreateAllowlistSet()
+	if !set["alice"] || !set["bob"] || set[""] {
+		t.Fatalf("CreateAllowlistSet = %+v", set)
+	}
+}
+
+func TestFromEnvCreateAllowUsersDefaultsToEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		if key == "API_TOKEN" {
+			return "token"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if len(cfg.CreateAllowUsers) != 0 {
+		t.Fatalf("expected empty CreateAllowUsers, got %v", cfg.CreateAllowUsers)
+	}
+	if set := cfg.CreateAllowlistSet(); len(set) != 0 {
+		t.Fatalf("expected empty CreateAllowlistSet, got %v", set)
+	}
+}
+
 func TestValidateRequiresNonEmptyFields(t *testing.T) {
 	t.Parallel()
 	base := Config{APIToken: "token", Addr: ":8080", CommandName: "brain", SlackAppName: "workspace-brain", ReadHeaderTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, ShutdownTimeout: time.Second}
