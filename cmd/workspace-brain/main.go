@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
@@ -29,9 +28,6 @@ type serveFunc func(context.Context, *http.Server, config.Config) error
 
 type appGateway interface {
 	slackadapter.Gateway
-	Ask(ctx context.Context, cmd gateway.AskCommand) (brainapi.QueryResponse, error)
-	CreateProject(ctx context.Context, cmd gateway.CreateProjectCommand) (gateway.CreateProjectResult, error)
-	Ingest(ctx context.Context, cmd gateway.IngestCommand) (gateway.IngestResult, error)
 }
 
 type demoCore interface {
@@ -210,22 +206,4 @@ func slackManifestHandler(cfg slackadapter.ManifestConfig) (http.Handler, error)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	}), nil
-}
-
-func parseAdminUsers(raw string) map[string]bool {
-	admins := make(map[string]bool)
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			admins[part] = true
-		}
-	}
-	return admins
-}
-
-func envOr(getenv envFunc, key, fallback string) string {
-	if value := getenv(key); value != "" {
-		return value
-	}
-	return fallback
 }

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sangyi/workspace-brain/internal/control/frontend"
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
@@ -346,14 +347,22 @@ func TestHandlerValidateCommandDefaultAndHelpers(t *testing.T) {
 	if err := h.validateCommand("/brain"); err != nil {
 		t.Fatalf("default command: %v", err)
 	}
-	if got := intString(0); got != "0" {
-		t.Fatalf("intString(0)=%q", got)
-	}
-	if got := intString(42); got != "42" {
-		t.Fatalf("intString(42)=%q", got)
-	}
 	if got := safeMessage(errors.New("plain")); got != "plain" {
 		t.Fatalf("safe plain=%q", got)
+	}
+}
+
+func TestRenderMapsVisibilityToSlackResponseType(t *testing.T) {
+	t.Parallel()
+
+	got := render(frontend.Response{Visibility: frontend.VisibilityPrivate, Text: "hello"})
+	if got.ResponseType != "ephemeral" || got.Text != "hello" {
+		t.Fatalf("private: %+v", got)
+	}
+
+	got = render(frontend.Response{Text: "broadcast"})
+	if got.ResponseType != "in_channel" || got.Text != "broadcast" {
+		t.Fatalf("default (empty visibility): %+v", got)
 	}
 }
 

@@ -26,7 +26,7 @@ func TestRunDemo(t *testing.T) {
 	if err := runDemo(context.Background(), &out); err != nil {
 		t.Fatalf("runDemo: %v", err)
 	}
-	if !strings.Contains(out.String(), "tenant=tenant-000001") || !strings.Contains(out.String(), "job=job-000001") {
+	if !strings.Contains(out.String(), "tenant=tenant-") || !strings.Contains(out.String(), "job=job-") {
 		t.Fatalf("demo output = %q", out.String())
 	}
 }
@@ -299,24 +299,6 @@ func TestSlackManifestHandlerValidation(t *testing.T) {
 	t.Parallel()
 	if _, err := slackManifestHandler(slackadapter.ManifestConfig{}); err == nil {
 		t.Fatalf("expected validation error")
-	}
-}
-
-func TestParseAdminUsers(t *testing.T) {
-	t.Parallel()
-	admins := parseAdminUsers(" U1, U2,, ")
-	if !admins["U1"] || !admins["U2"] || admins[""] {
-		t.Fatalf("admins = %+v", admins)
-	}
-}
-
-func TestEnvOr(t *testing.T) {
-	t.Parallel()
-	if got := envOr(func(string) string { return "" }, "KEY", "fallback"); got != "fallback" {
-		t.Fatalf("fallback = %q", got)
-	}
-	if got := envOr(func(string) string { return "value" }, "KEY", "fallback"); got != "value" {
-		t.Fatalf("value = %q", got)
 	}
 }
 

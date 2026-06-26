@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -61,7 +62,8 @@ func (h *Handler) authorized(r *http.Request) bool {
 	if !strings.HasPrefix(header, prefix) {
 		return false
 	}
-	return strings.TrimSpace(strings.TrimPrefix(header, prefix)) == h.Token
+	provided := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(h.Token)) == 1
 }
 
 type commandRequest struct {

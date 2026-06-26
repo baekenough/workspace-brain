@@ -199,7 +199,7 @@ func (c *OpenAIClient) doJSON(ctx context.Context, method, endpoint string, body
 		return brainapi.E(brainapi.KindInternal, op, "response read failed", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return brainapi.E(brainapi.KindInternal, op, fmt.Sprintf("provider returned status %d", resp.StatusCode), nil)
+		return brainapi.E(brainapi.KindInternal, op, fmt.Sprintf("provider returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(data))), nil)
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return brainapi.E(brainapi.KindInternal, op, "response json is invalid", err)

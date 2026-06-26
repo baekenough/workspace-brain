@@ -162,7 +162,10 @@ func ephemeral(text string) slackResponse {
 }
 
 func render(response frontend.Response) slackResponse {
-	return ephemeral(response.Text)
+	if response.Visibility == frontend.VisibilityPrivate {
+		return ephemeral(response.Text)
+	}
+	return slackResponse{ResponseType: "in_channel", Text: response.Text}
 }
 
 func safeMessage(err error) string {
@@ -185,18 +188,4 @@ func cloneBoolMap(in map[string]bool) map[string]bool {
 		out[k] = v
 	}
 	return out
-}
-
-func intString(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }

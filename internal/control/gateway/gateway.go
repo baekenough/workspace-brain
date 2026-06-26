@@ -3,8 +3,8 @@ package gateway
 
 import (
 	"context"
-	"fmt"
-	"sync/atomic"
+	"crypto/rand"
+	"encoding/hex"
 
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
@@ -89,8 +89,8 @@ func New(core brainapi.Core, authorizer Authorizer, jobStore *jobs.Store, opts .
 		core:       core,
 		authorizer: authorizer,
 		jobs:       jobStore,
-		tenantIDs:  &sequenceTenantIDGenerator{},
-		jobIDs:     &sequenceJobIDGenerator{},
+		tenantIDs:  &randTenantIDGenerator{},
+		jobIDs:     &randJobIDGenerator{},
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -315,14 +315,23 @@ func cloneMap(in map[string]string) map[string]string {
 	return out
 }
 
-type sequenceTenantIDGenerator struct{ n atomic.Uint64 }
+// randTenantIDGenerator produces collision-resistant tenant IDs using 128 bits of
+// crypto/rand entropy. Unlike the old sequence-based generator, IDs do not reset
+// to zero on process restart, so they never collide with records in a persistent core.
+type randTenantIDGenerator struct{}
 
-func (g *sequenceTenantIDGenerator) NewTenantID() brainapi.TenantID {
-	return brainapi.TenantID(fmt.Sprintf("tenant-%06d", g.n.Add(1)))
+func (g *randTenantIDGenerator) NewTenantID() brainapi.TenantID {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return brainapi.TenantID("tenant-" + hex.EncodeToString(b[:]))
 }
 
-type sequenceJobIDGenerator struct{ n atomic.Uint64 }
+// randJobIDGenerator produces collision-resistant job IDs using 128 bits of
+// crypto/rand entropy for the same restart-safety reason as randTenantIDGenerator.
+type randJobIDGenerator struct{}
 
-func (g *sequenceJobIDGenerator) NewJobID() brainapi.JobID {
-	return brainapi.JobID(fmt.Sprintf("job-%06d", g.n.Add(1)))
+func (g *randJobIDGenerator) NewJobID() brainapi.JobID {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return brainapi.JobID("job-" + hex.EncodeToString(b[:]))
 }

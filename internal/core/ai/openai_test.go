@@ -7,7 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
+
+	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
 func TestLocalClientDoesNotRequireAPIKey(t *testing.T) {
@@ -35,6 +38,12 @@ func TestLocalClientRespondReturnsErrorWhenInputIsBlank(t *testing.T) {
 	_, err := (LocalClient{}).Respond(context.Background(), " \t\n ")
 	if err == nil {
 		t.Fatal("expected blank input to be rejected")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "input is required") {
+		t.Fatalf("expected 'input is required' in error: %v", err)
 	}
 }
 
@@ -112,6 +121,12 @@ func TestOpenAIClientEmbedRejectsNilClient(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected nil client to be rejected")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "client is required") {
+		t.Fatalf("expected 'client is required' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientEmbedRequiresEmbeddingModel(t *testing.T) {
@@ -125,6 +140,12 @@ func TestOpenAIClientEmbedRequiresEmbeddingModel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing embedding model to be rejected")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "embedding model is required") {
+		t.Fatalf("expected 'embedding model is required' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientEmbedReturnsDoJSONError(t *testing.T) {
@@ -137,6 +158,12 @@ func TestOpenAIClientEmbedReturnsDoJSONError(t *testing.T) {
 	_, err = client.Embed(context.Background(), []string{"alpha"})
 	if err == nil {
 		t.Fatal("expected doJSON error to be returned")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "api key is required") {
+		t.Fatalf("expected 'api key is required' in error: %v", err)
 	}
 }
 
@@ -171,6 +198,12 @@ func TestOpenAIClientRespondRejectsNilClient(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected nil client to be rejected")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "client is required") {
+		t.Fatalf("expected 'client is required' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientRespondRequiresResponseModel(t *testing.T) {
@@ -184,6 +217,12 @@ func TestOpenAIClientRespondRequiresResponseModel(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing response model to be rejected")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "response model is required") {
+		t.Fatalf("expected 'response model is required' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientRespondReturnsDoJSONError(t *testing.T) {
@@ -196,6 +235,12 @@ func TestOpenAIClientRespondReturnsDoJSONError(t *testing.T) {
 	_, err = client.Respond(context.Background(), "hello")
 	if err == nil {
 		t.Fatal("expected doJSON error to be returned")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "api key is required") {
+		t.Fatalf("expected 'api key is required' in error: %v", err)
 	}
 }
 
@@ -250,6 +295,12 @@ func TestOpenAIClientRespondErrorsWhenResponseHasNoText(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected response without text to fail")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "response did not include text") {
+		t.Fatalf("expected 'response did not include text' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientDoJSONRequiresAPIKey(t *testing.T) {
@@ -262,6 +313,12 @@ func TestOpenAIClientDoJSONRequiresAPIKey(t *testing.T) {
 	err = client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
 	if err == nil {
 		t.Fatal("expected missing api key to fail")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "api key is required") {
+		t.Fatalf("expected 'api key is required' in error: %v", err)
 	}
 }
 
@@ -276,6 +333,12 @@ func TestOpenAIClientDoJSONRejectsInvalidPayload(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid payload to fail")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "request payload is invalid") {
+		t.Fatalf("expected 'request payload is invalid' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientDoJSONRejectsInvalidRequest(t *testing.T) {
@@ -288,6 +351,12 @@ func TestOpenAIClientDoJSONRejectsInvalidRequest(t *testing.T) {
 	err = client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
 	if err == nil {
 		t.Fatal("expected invalid request URL to fail")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("expected KindInvalid, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "request is invalid") {
+		t.Fatalf("expected 'request is invalid' in error: %v", err)
 	}
 }
 
@@ -305,6 +374,12 @@ func TestOpenAIClientDoJSONReturnsRequestFailure(t *testing.T) {
 	err = client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
 	if err == nil {
 		t.Fatal("expected request failure")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "request failed") {
+		t.Fatalf("expected 'request failed' in error: %v", err)
 	}
 }
 
@@ -325,6 +400,12 @@ func TestOpenAIClientDoJSONReturnsReadFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected response read failure")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "response read failed") {
+		t.Fatalf("expected 'response read failed' in error: %v", err)
+	}
 }
 
 func TestOpenAIClientDoJSONReturnsNon2xxStatus(t *testing.T) {
@@ -338,6 +419,15 @@ func TestOpenAIClientDoJSONReturnsNon2xxStatus(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected non-2xx response to fail")
 	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "418") {
+		t.Fatalf("expected status code 418 in error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "short and stout") {
+		t.Fatalf("expected provider body in error: %v", err)
+	}
 }
 
 func TestOpenAIClientDoJSONReturnsInvalidJSON(t *testing.T) {
@@ -349,6 +439,12 @@ func TestOpenAIClientDoJSONReturnsInvalidJSON(t *testing.T) {
 	err := client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
 	if err == nil {
 		t.Fatal("expected invalid json to fail")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "response json is invalid") {
+		t.Fatalf("expected 'response json is invalid' in error: %v", err)
 	}
 }
 

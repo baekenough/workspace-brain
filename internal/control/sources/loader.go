@@ -3,14 +3,17 @@ package sources
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
@@ -38,9 +41,10 @@ type LoadedSource struct {
 
 // Loader loads file, HTTP(S), and inline/raw text sources using the standard library.
 type Loader struct {
-	MaxBytes   int64
-	Timeout    time.Duration
-	HTTPClient *http.Client
+	MaxBytes    int64
+	Timeout     time.Duration
+	HTTPClient  *http.Client
+	FileBaseDir string // When empty, file:// sources are denied.
 }
 
 // Option configures Loader.
@@ -73,14 +77,114 @@ func WithHTTPClient(client *http.Client) Option {
 	}
 }
 
+// WithFileBaseDir sets the directory that file:// URIs must reside within.
+// Requests for paths outside this directory, or for file:// when unset, are
+// rejected with KindInvalid to prevent local-file-inclusion attacks.
+func WithFileBaseDir(dir string) Option {
+	return func(l *Loader) {
+		if dir != "" {
+			l.FileBaseDir = filepath.Clean(dir)
+		}
+	}
+}
+
 // NewLoader creates a safe default source loader.
 func NewLoader(opts ...Option) *Loader {
-	l := &Loader{MaxBytes: DefaultMaxBytes, Timeout: DefaultTimeout, HTTPClient: http.DefaultClient}
+	l := &Loader{
+		MaxBytes:   DefaultMaxBytes,
+		Timeout:    DefaultTimeout,
+		HTTPClient: newSSRFSafeClient(DefaultTimeout),
+	}
 	for _, opt := range opts {
 		opt(l)
 	}
 	return l
 }
+
+// isBlockedIP reports whether ip falls within any address range that must not
+// be reachable from an externally-supplied URI (SSRF prevention).
+//
+// Blocked ranges: loopback (127/8, ::1), link-local (169.254/16, fe80::/10),
+// private / unique-local (RFC 1918, fc00::/7), and unspecified (0.0.0.0, ::).
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsPrivate() || // RFC 1918 + fc00::/7 (unique-local)
+		ip.IsUnspecified()
+}
+
+// ssrfDialContext returns a DialContext function that validates all resolved IPs
+// against SSRF-blocked ranges before connecting.
+//
+// rawDial performs the actual TCP connection.
+// lookupIP resolves hostnames to IP addresses; pass net.DefaultResolver.LookupIPAddr
+// in production and a mock in tests.
+//
+// Hostnames are resolved by lookupIP before dialing so that:
+//   - every IP in the resolved set is validated, and
+//   - the final dial uses the first resolved IP directly, preventing DNS rebinding.
+func ssrfDialContext(
+	rawDial func(ctx context.Context, network, address string) (net.Conn, error),
+	lookupIP func(ctx context.Context, host string) ([]net.IPAddr, error),
+) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("ssrf: invalid address %q: %w", address, err)
+		}
+		// Fast path: address is already a numeric IP.
+		if ip := net.ParseIP(host); ip != nil {
+			if isBlockedIP(ip) {
+				return nil, fmt.Errorf("ssrf: connection to %s is not allowed", ip)
+			}
+			return rawDial(ctx, network, address)
+		}
+		// Hostname path: resolve, check each IP, then dial the first resolved
+		// address directly to prevent DNS rebinding between check and connect.
+		addrs, err := lookupIP(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("ssrf: failed to resolve %q: %w", host, err)
+		}
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("ssrf: no addresses resolved for %q", host)
+		}
+		for _, a := range addrs {
+			if isBlockedIP(a.IP) {
+				return nil, fmt.Errorf("ssrf: connection to %s (%s) is not allowed", host, a.IP)
+			}
+		}
+		return rawDial(ctx, network, net.JoinHostPort(addrs[0].IP.String(), port))
+	}
+}
+
+// newSSRFSafeClient returns an *http.Client whose DialContext rejects any
+// connection whose resolved IP falls within a blocked range.
+func newSSRFSafeClient(timeout time.Duration) *http.Client {
+	if timeout <= 0 {
+		timeout = DefaultTimeout
+	}
+	d := &net.Dialer{}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			DialContext: ssrfDialContext(d.DialContext, net.DefaultResolver.LookupIPAddr),
+		},
+		// CheckRedirect caps hop count.  DialContext validates the resolved IP
+		// for every redirect target, so internal addresses are blocked even
+		// after a 302 to an internal host.
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("ssrf: too many redirects")
+			}
+			return nil
+		},
+	}
+}
+
+// osStat and osOpenFile are package-level variables so tests can inject stubs
+// that simulate errors after a successful filepath.EvalSymlinks.
+var osStat = os.Stat
+var osOpenFile = os.OpenFile
 
 // Load returns metadata with MetadataContentKey populated, preserving existing metadata.
 func (l *Loader) Load(ctx context.Context, source brainapi.SourceRef, metadata map[string]string) (LoadedSource, error) {
@@ -149,11 +253,56 @@ func (l *Loader) Load(ctx context.Context, source brainapi.SourceRef, metadata m
 
 func (l *Loader) loadFile(ctx context.Context, out LoadedSource, u *url.URL) (LoadedSource, error) {
 	const op = "source_load_file"
+	// Deny file:// entirely when no safe base directory has been configured.
+	if l.FileBaseDir == "" {
+		return LoadedSource{}, brainapi.E(brainapi.KindInvalid, op, "file:// sources are not configured", nil)
+	}
 	filePath, err := fileURLPath(u)
 	if err != nil {
 		return LoadedSource{}, err
 	}
-	f, err := os.Open(filePath)
+	cleaned := filepath.Clean(filePath)
+
+	// Phase 1: lexical containment check on the cleaned path.
+	// This rejects path traversals and obviously-out-of-scope paths (e.g.,
+	// /etc/passwd, ../secret) without requiring the target file to exist.
+	// The separator suffix prevents "/allowed/dir" matching "/allowed/dirfoo/…".
+	sep := string(filepath.Separator)
+	if !strings.HasPrefix(cleaned+sep, l.FileBaseDir+sep) {
+		return LoadedSource{}, brainapi.E(brainapi.KindInvalid, op, "file source is outside allowed directory", nil)
+	}
+
+	// Phase 2: symlink-resolved containment check.
+	// Resolve symlinks on BOTH sides so that a symlink INSIDE FileBaseDir that
+	// points outside is caught here rather than silently followed by the open.
+	realBase, err := filepath.EvalSymlinks(l.FileBaseDir)
+	if err != nil {
+		return LoadedSource{}, brainapi.E(brainapi.KindInvalid, op, "file:// base directory is not accessible", err)
+	}
+	realPath, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		// File does not exist or is not reachable; phase 1 already ruled out
+		// traversal, so this is a missing-file condition, not an attack.
+		return LoadedSource{}, brainapi.E(brainapi.KindNotFound, op, "file source is not readable", err)
+	}
+	if !strings.HasPrefix(realPath+sep, realBase+sep) {
+		return LoadedSource{}, brainapi.E(brainapi.KindInvalid, op, "file source is outside allowed directory", nil)
+	}
+
+	// Stat the resolved path to detect non-regular files (FIFO, device, socket)
+	// before attempting to open: os.Open on a FIFO blocks indefinitely.
+	info, statErr := osStat(realPath)
+	if statErr != nil {
+		return LoadedSource{}, brainapi.E(brainapi.KindNotFound, op, "file source is not readable", statErr)
+	}
+	if !info.Mode().IsRegular() {
+		return LoadedSource{}, brainapi.E(brainapi.KindInvalid, op, "file source must be a regular file", nil)
+	}
+
+	// Open with O_NOFOLLOW to defeat the TOCTOU window between EvalSymlinks and
+	// open: if the file at realPath is swapped for a symlink in that interval,
+	// the kernel refuses the open call with ELOOP.
+	f, err := osOpenFile(realPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return LoadedSource{}, brainapi.E(brainapi.KindNotFound, op, "file source is not readable", err)
 	}
@@ -165,10 +314,10 @@ func (l *Loader) loadFile(ctx context.Context, out LoadedSource, u *url.URL) (Lo
 	ensureMetadata(&out)
 	out.Metadata[MetadataContentKey] = content
 	if out.Source.Name == "" {
-		out.Source.Name = filepath.Base(filePath)
+		out.Source.Name = filepath.Base(realPath)
 	}
 	if out.Source.MimeType == "" {
-		out.Source.MimeType = mime.TypeByExtension(filepath.Ext(filePath))
+		out.Source.MimeType = mime.TypeByExtension(filepath.Ext(realPath))
 	}
 	if out.Source.MimeType == "" {
 		out.Source.MimeType = "text/plain; charset=utf-8"
@@ -180,7 +329,9 @@ func (l *Loader) loadHTTP(ctx context.Context, out LoadedSource) (LoadedSource, 
 	const op = "source_load_http"
 	client := l.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		// Fall back to a fresh SSRF-safe client rather than http.DefaultClient,
+		// so callers that construct Loader directly still get SSRF protection.
+		client = newSSRFSafeClient(l.timeout())
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, out.Source.URI, nil)
 	if err != nil {
@@ -307,11 +458,18 @@ func (l *Loader) timeout() time.Duration {
 	return l.Timeout
 }
 
+// withOptionalTimeout applies timeout as an upper bound on ctx.  When the
+// parent context already carries a deadline that fires sooner than timeout, the
+// parent context is returned unchanged so the earlier deadline is honoured.
+// This replaces the previous behaviour that silently ignored the timeout
+// whenever any deadline existed at all, which could allow long-lived parent
+// deadlines to bypass the intended per-load time cap.
 func withOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return ctx, func() {}
 	}
-	if _, ok := ctx.Deadline(); ok {
+	if d, ok := ctx.Deadline(); ok && d.Before(time.Now().Add(timeout)) {
+		// Parent deadline fires sooner; keep it as-is.
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)

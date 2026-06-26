@@ -75,7 +75,7 @@ func TestDispatcherAdminCapabilitySeams(t *testing.T) {
 		t.Fatalf("admin without capability err=%v", err)
 	}
 	admin := &fakeGateway{}
-	res, err := NewDispatcherWithAdmin(userOnly, admin).Handle(context.Background(), Request{Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}, Text: "admin on tenant-1"})
+	res, err := newDispatcherWithAdmin(userOnly, admin).Handle(context.Background(), Request{Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}, Text: "admin on tenant-1"})
 	if err != nil {
 		t.Fatalf("admin with explicit capability: %v", err)
 	}

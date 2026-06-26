@@ -485,6 +485,59 @@ func TestGatewayRemainingErrorBranches(t *testing.T) {
 	}
 }
 
+// TestDefaultGeneratorsProduceCollisionResistantIDs is a restart-collision regression
+// test. The old sequential generators (atomic counter) reset to 0 on every process
+// start and re-emitted "tenant-000001" / "job-000001", which collide with records
+// already stored in a persistent core. The new crypto/rand generators must produce
+// IDs that are unique across many calls and never match the old sequential format.
+func TestDefaultGeneratorsProduceCollisionResistantIDs(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	// No WithTenantIDGenerator / WithJobIDGenerator overrides: exercises the new defaults.
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const n = 20
+	seenTenants := make(map[brainapi.TenantID]bool, n)
+	for i := 0; i < n; i++ {
+		result, err := gw.CreateProject(context.Background(), CreateProjectCommand{
+			BindingKey: "slack:channel:C1", // fakeCore does not enforce binding uniqueness
+			Principal:  brainapi.Principal{ID: "admin", Roles: []string{"admin"}},
+		})
+		if err != nil {
+			t.Fatalf("CreateProject[%d]: %v", i, err)
+		}
+		if string(result.TenantID) == "tenant-000001" {
+			t.Fatalf("generated tenant ID collides with old sequential format: %q", result.TenantID)
+		}
+		if seenTenants[result.TenantID] {
+			t.Fatalf("duplicate tenant ID at iteration %d: %q", i, result.TenantID)
+		}
+		seenTenants[result.TenantID] = true
+	}
+
+	seenJobs := make(map[brainapi.JobID]bool, n)
+	for i := 0; i < n; i++ {
+		result, err := gw.Ingest(context.Background(), IngestCommand{
+			BindingKey: "slack:channel:C1",
+			Principal:  brainapi.Principal{ID: "U1", Roles: []string{"member"}},
+			Source:     brainapi.SourceRef{URI: "file://a.pdf"},
+		})
+		if err != nil {
+			t.Fatalf("Ingest[%d]: %v", i, err)
+		}
+		if string(result.JobID) == "job-000001" {
+			t.Fatalf("generated job ID collides with old sequential format: %q", result.JobID)
+		}
+		if seenJobs[result.JobID] {
+			t.Fatalf("duplicate job ID at iteration %d: %q", i, result.JobID)
+		}
+		seenJobs[result.JobID] = true
+	}
+}
+
 type fakeSourceLoader struct {
 	loaded sources.LoadedSource
 	err    error

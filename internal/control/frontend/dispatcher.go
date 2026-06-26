@@ -60,8 +60,8 @@ func NewDispatcher(gw Gateway) *Dispatcher {
 	return d
 }
 
-// NewDispatcherWithAdmin creates a command dispatcher with an explicit admin capability.
-func NewDispatcherWithAdmin(gw Gateway, admin AdminGateway) *Dispatcher {
+// newDispatcherWithAdmin creates a command dispatcher with an explicit admin capability.
+func newDispatcherWithAdmin(gw Gateway, admin AdminGateway) *Dispatcher {
 	return &Dispatcher{gateway: gw, admin: admin}
 }
 
