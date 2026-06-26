@@ -33,8 +33,24 @@ func TestServeHTTPRoutesDefaultEndpoints(t *testing.T) {
 func TestServeHTTPRejectsUnknownEndpoint(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(nil)
-	rec := performPath(h, http.MethodGet, "/metrics")
+	rec := performPath(h, http.MethodGet, "/unknown")
 	assertResponse(t, rec, http.StatusNotFound, statusResponse{Status: "error", Error: "endpoint not found"})
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(nil)
+	rec := performPath(h, http.MethodGet, MetricsPath)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d want=200 body=%s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type=%q, want application/json; charset=utf-8", ct)
+	}
+	body := rec.Body.Bytes()
+	if len(body) == 0 || body[0] != '{' {
+		t.Fatalf("expected JSON object body, got: %s", body)
+	}
 }
 
 func TestHealth(t *testing.T) {

@@ -4,6 +4,7 @@ package ops
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"net/http"
 )
 
@@ -24,6 +25,7 @@ func (f ReadinessCheck) Ready(ctx context.Context) error {
 const (
 	HealthPath    = "/healthz"
 	ReadinessPath = "/readyz"
+	MetricsPath   = "/metrics"
 )
 
 // Handler serves JSON health and readiness endpoints.
@@ -43,6 +45,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.Health(w, r)
 	case ReadinessPath:
 		h.Readiness(w, r)
+	case MetricsPath:
+		expvar.Handler().ServeHTTP(w, r)
 	default:
 		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Error: "endpoint not found"})
 	}

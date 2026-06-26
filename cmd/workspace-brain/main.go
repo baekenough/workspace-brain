@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"github.com/sangyi/workspace-brain/internal/core/ai"
 	"github.com/sangyi/workspace-brain/internal/core/memory"
 	"github.com/sangyi/workspace-brain/internal/platform/config"
+	"github.com/sangyi/workspace-brain/internal/platform/obs"
 	platformserver "github.com/sangyi/workspace-brain/internal/platform/server"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
@@ -64,6 +66,10 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 	if err != nil {
 		return err
 	}
+	// Configure structured logging for the lifetime of this server run.
+	// LOG_FORMAT=json selects JSON output; anything else uses text (default).
+	slog.SetDefault(obs.NewLogger(os.Stderr, getenv("LOG_FORMAT")))
+
 	core, err := newConfiguredCore(cfg)
 	if err != nil {
 		return err
@@ -95,7 +101,7 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 		IdleTimeout:       cfg.IdleTimeout,
 		ShutdownTimeout:   cfg.ShutdownTimeout,
 	}, handler)
-	log.Printf("workspace-brain listening on %s", cfg.Addr)
+	slog.Info("workspace-brain listening", "addr", cfg.Addr)
 	return serve(ctx, srv, cfg)
 }
 
@@ -215,6 +221,7 @@ func buildHandler(cfg config.Config, gw appGateway) (http.Handler, error) {
 	opsHandler := ops.NewHandler(readinessChecker(cfg))
 	mux.Handle(ops.HealthPath, opsHandler)
 	mux.Handle(ops.ReadinessPath, opsHandler)
+	mux.Handle(ops.MetricsPath, opsHandler)
 	if cfg.SlackSigningSecret != "" {
 		slackHandler := slackadapter.NewHandler(gw, cfg.SlackSigningSecret, cfg.AdminUserSet())
 		slackHandler.CommandName = cfg.CommandName
@@ -236,7 +243,17 @@ func buildHandler(cfg config.Config, gw appGateway) (http.Handler, error) {
 	if cfg.APIToken != "" {
 		mux.Handle("/api/commands", httpapi.NewHandler(gw, cfg.APIToken))
 	}
-	return mux, nil
+
+	// Wrap the mux with operational middleware.
+	// CountingMiddleware increments http_requests_total on every request.
+	// CorrelationMiddleware propagates or generates X-Request-ID and logs
+	// each request with the active slog logger, threading the correlation ID
+	// into the request context so downstream handlers can attach it to records.
+	counters := obs.NewCounters()
+	var h http.Handler = mux
+	h = obs.CountingMiddleware(counters)(h)
+	h = obs.CorrelationMiddleware(slog.Default(), nil)(h)
+	return h, nil
 }
 
 func readinessChecker(cfg config.Config) ops.ReadinessChecker {
