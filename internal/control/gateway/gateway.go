@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
+	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
@@ -40,6 +41,7 @@ type Gateway struct {
 	jobs       *jobs.Store
 	tenantIDs  TenantIDGenerator
 	jobIDs     JobIDGenerator
+	loader     sources.SourceLoader
 }
 
 // Option configures a Gateway.
@@ -59,6 +61,15 @@ func WithJobIDGenerator(gen JobIDGenerator) Option {
 	return func(g *Gateway) {
 		if gen != nil {
 			g.jobIDs = gen
+		}
+	}
+}
+
+// WithSourceLoader loads source content before core ingestion when Metadata["content"] is absent.
+func WithSourceLoader(loader sources.SourceLoader) Option {
+	return func(g *Gateway) {
+		if loader != nil {
+			g.loader = loader
 		}
 	}
 }
@@ -188,7 +199,20 @@ func (g *Gateway) Ingest(ctx context.Context, cmd IngestCommand) (IngestResult, 
 	if _, err := g.jobs.PutAccepted(tenantID, jobID); err != nil {
 		return IngestResult{}, err
 	}
-	if err := g.core.Ingest(ctx, brainapi.IngestRequest{TenantID: tenantID, JobID: jobID, Source: cmd.Source, Metadata: cloneMap(cmd.Metadata)}); err != nil {
+	source := cmd.Source
+	metadata := cloneMap(cmd.Metadata)
+	if metadata == nil || metadata[sources.MetadataContentKey] == "" {
+		if g.loader != nil {
+			loaded, err := g.loader.Load(ctx, source, metadata)
+			if err != nil {
+				_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
+				return IngestResult{}, err
+			}
+			source = loaded.Source
+			metadata = cloneMap(loaded.Metadata)
+		}
+	}
+	if err := g.core.Ingest(ctx, brainapi.IngestRequest{TenantID: tenantID, JobID: jobID, Source: source, Metadata: metadata}); err != nil {
 		_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
 		return IngestResult{}, err
 	}
@@ -215,6 +239,40 @@ func (g *Gateway) Status(ctx context.Context, cmd StatusCommand) (brainapi.JobSn
 		return g.jobs.Reconcile(ctx, g.core, tenantID, cmd.JobID)
 	}
 	return g.jobs.Snapshot(tenantID, cmd.JobID)
+}
+
+// SetProjectStateCommand asks the gateway to change a tenant lifecycle state.
+type SetProjectStateCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+	State     brainapi.ProjectState
+}
+
+// SetProjectStateResult confirms the updated tenant lifecycle state.
+type SetProjectStateResult struct {
+	TenantID brainapi.TenantID
+	State    brainapi.ProjectState
+}
+
+// SetProjectState authorizes an admin principal and updates core tenant state.
+func (g *Gateway) SetProjectState(ctx context.Context, cmd SetProjectStateCommand) (SetProjectStateResult, error) {
+	const op = "gateway_set_project_state"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return SetProjectStateResult{}, err
+	}
+	if cmd.State != brainapi.ProjectOn && cmd.State != brainapi.ProjectOff {
+		return SetProjectStateResult{}, brainapi.E(brainapi.KindInvalid, op, "unknown project state", nil)
+	}
+	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin}); err != nil {
+		return SetProjectStateResult{}, brainapi.SafeAccessError(op)
+	}
+	if err := g.core.SetProjectState(ctx, cmd.TenantID, cmd.State); err != nil {
+		if brainapi.IsKind(err, brainapi.KindNotFound) || brainapi.IsKind(err, brainapi.KindUnauthorized) {
+			return SetProjectStateResult{}, brainapi.SafeAccessError(op)
+		}
+		return SetProjectStateResult{}, err
+	}
+	return SetProjectStateResult{TenantID: cmd.TenantID, State: cmd.State}, nil
 }
 
 // HandleJobCompleted applies a core callback to the control-plane store.

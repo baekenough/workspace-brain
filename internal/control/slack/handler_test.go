@@ -298,6 +298,48 @@ func TestHandlerDispatchBranches(t *testing.T) {
 	}
 }
 
+func TestHandlerServeInteraction(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedRequest(formBody("payload")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertTextContains(t, rec.Body.String(), "상호작용 요청이 접수되었습니다")
+}
+
+func TestHandlerServeInteractionErrors(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	for _, tt := range []struct {
+		name   string
+		h      *Handler
+		req    *http.Request
+		status int
+	}{
+		{"method", h, httptest.NewRequest(http.MethodGet, "/slack/interactions", nil), http.StatusMethodNotAllowed},
+		{"missing config", &Handler{}, httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(formBody("payload"))), http.StatusInternalServerError},
+		{"read", h, httptest.NewRequest(http.MethodPost, "/slack/interactions", errReader{}), http.StatusBadRequest},
+		{"signature", h, httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(formBody("payload"))), http.StatusUnauthorized},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.h.Now == nil {
+				tt.h.Now = fixedNow
+			}
+			rec := httptest.NewRecorder()
+			tt.h.ServeInteraction(rec, tt.req)
+			if rec.Code != tt.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tt.status, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestHandlerValidateCommandDefaultAndHelpers(t *testing.T) {
 	t.Parallel()
 	h := &Handler{}

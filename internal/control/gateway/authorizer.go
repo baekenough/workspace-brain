@@ -6,7 +6,7 @@ import (
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
-// RoleAuthorizer is a small deterministic authorizer for the walking skeleton.
+// RoleAuthorizer is a small deterministic authorizer for the local runtime.
 type RoleAuthorizer struct{}
 
 // Authorize allows admins to do everything and members to read/write existing tenants.

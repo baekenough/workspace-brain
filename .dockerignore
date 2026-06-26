@@ -1,0 +1,14 @@
+.git
+.github
+.omx
+**/.DS_Store
+**/coverage.out
+**/*.test
+.env
+.env.*
+omcustom.zip
+Dockerfile
+README.md
+docs/
+guides/
+omcustom/

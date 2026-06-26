@@ -1,82 +1,62 @@
 # workspace-brain
 
-**workspace-brain**은 Slack 같은 업무 도구에서 흩어지는 맥락을 프로젝트 단위로 모으고, 안전하게 검색하고, 근거와 함께 다시 꺼내 쓰기 위한 **멀티테넌트 RAG 플랫폼의 실행 가능한 Go 골격**입니다.
+workspace-brain is a **surface-neutral RAG control plane** for collecting, isolating, and querying project knowledge by tenant.
 
-이 저장소는 완성된 챗봇이 아닙니다. 먼저 단단한 뼈대를 세웁니다. 표면은 바뀌어도 흔들리지 않는 계약, 테넌트 격리, 안전한 에러 처리, 엄격한 테스트를 고정하고 그 위에 실제 저장소·큐·임베딩·검색 어댑터를 붙이는 방식으로 성장합니다.
+Slack is not the product boundary. Slack is one frontend adapter beside the JSON HTTP adapter and future Web, CLI, or Admin UI adapters. The shared center is the gateway/core contract that accepts tenant-scoped commands, source references, and questions.
 
-## 무엇을 지향하나
+## What it is
 
-- **업무 표면과 데이터 코어를 분리합니다.** Slack, Web, CLI가 늘어나도 Core 계약은 그대로 유지합니다.
-- **프로젝트별 경계를 먼저 지킵니다.** 모든 요청은 `tenant_id`로 정규화되고, Core는 검증된 테넌트 범위 안에서만 동작합니다.
-- **비동기 작업의 소유권을 명확히 둡니다.** Gateway가 `job_id`를 만들고, Control Plane이 사용자에게 보여 줄 상태를 책임집니다.
-- **테스트가 설계를 잠급니다.** 공개 저장소에서 자신 있게 확장할 수 있도록 statement coverage 100.0%를 CI 기준으로 둡니다.
+workspace-brain keeps frontend surfaces separate from tenant-scoped RAG operations:
 
-## 지금 들어 있는 것
+```text
+Frontend Adapter -> Frontend Dispatcher -> Control Gateway -> Data Core Contract
+```
 
-- Go 기반 walking skeleton
-- Control Plane / Data Core 경계
-- 표면 무관 Core 계약
-  - `resolve_binding`
-  - `create_project`
-  - `ingest`
-  - `get_job_status`
-  - `query`
-  - `discover`
-  - `set_project_state`
-- Gateway 계층
-  - binding 해석
-  - 권한 판정
-  - 존재/권한 에러 정규화
-  - Gateway 생성 `job_id`
-  - Control Plane 자체 job 상태 저장소
-- Slack slash-command HTTP adapter
-  - Slack 서명 검증
-  - `/brain create`
-  - `/brain ingest`
-  - `/brain ask`
-  - `/brain discover`
-  - `/brain status`
-- In-memory Data Core
-  - 테스트와 데모를 위한 tenant, binding, source, job 상태 저장
-- 엄격한 테스트
-  - contract validation
-  - tenant isolation
-  - duplicate protection
-  - job lifecycle
-  - callback/reconcile
-  - Slack signature 검증
-  - safe error message 검증
-  - race test 대상 구조
+- **Frontend Adapter** verifies surface-specific authentication and converts surface input into a `Principal`, `BindingKey`, and text command.
+- **Frontend Dispatcher** parses shared text commands and calls gateway operations.
+- **Control Gateway** resolves bindings, authorizes actions, creates `tenant_id` and `job_id` values, loads bounded source content, and normalizes safe access errors.
+- **Data Core** does not know about Slack, Web, CLI, or HTTP sessions. It receives only contract inputs such as `tenant_id`, `job_id`, `source_ref`, and `question`.
 
-## 아직 붙이지 않은 것
+## Current capabilities
 
-아래 영역은 의도적으로 interface 뒤로 미뤘습니다. 지금 단계의 목표는 외부 의존성보다 **계약과 경계**를 먼저 안정화하는 것입니다.
+Implemented in this repository:
 
-- PostgreSQL + RLS 기반 영속 저장소
-- Qdrant tenant collection 연동
-- RabbitMQ retry / DLQ 기반 수집 큐
-- OpenAI `text-embedding-3-large` embedding adapter
-- 하이브리드 검색, rerank, grounding, 출처 표시
-- Slack manifest-as-code와 interactivity
-- Admin surface
-- 운영 관측, 감사, 백업 정책
+- Surface-neutral `brainapi.Core` contract.
+- Gateway-managed project creation, ingest jobs, status reconciliation, safe access errors, and optional `admin on|off <tenant_id>` project state commands.
+- Local RAG memory core for development, tests, and local deployments:
+  - tenant catalog and binding registry
+  - source metadata and content ingest
+  - deterministic local embeddings
+  - lexical + vector scoring
+  - grounded answer/source/span response
+  - metadata-only discovery
+  - optional JSON snapshot persistence through `DATA_PATH`
+- Frontend adapters:
+  - JSON HTTP command API at `POST /api/commands`
+  - Slack slash-command adapter at `POST /slack/commands`
+  - Slack interactivity acknowledgement at `POST /slack/interactions`
+  - Slack manifest-as-code at `GET /slack/manifest.json` when `PUBLIC_BASE_URL` is configured
+- Source loader wired into the default gateway/server path for `file://`, `http://`, `https://`, `text:`/`text://`, `raw:`/`raw://`, plain/raw text, and inline metadata content.
+- Health and readiness endpoints at `GET /healthz` and `GET /readyz`.
+- Hardened HTTP server helper with read/write/idle/shutdown timeouts.
+- Dockerfile for a multi-stage, distroless, non-root image build.
+- Quality gates for release: unit tests, race test, vet, and a 100% coverage script.
 
-후속 작업은 GitHub Issues에서 관리합니다.
+Current boundaries:
 
-## 다음에 붙일 것들
+- The default serve path uses the local memory core and source loader. It does not call an external model provider.
+- `internal/core/ai` contains an optional OpenAI-compatible client seam. It is not wired into the default server path.
+- PostgreSQL, Qdrant, RabbitMQ, background ingest workers, Compose files, and orchestrator manifests are roadmap adapters, not committed runtime dependencies.
+- Server-mode ingest stores chunks immediately and returns a running job. No committed background worker marks jobs completed in server mode yet.
 
-- [#1 PostgreSQL + RLS 영속 저장소 adapter 붙이기](https://github.com/baekenough/workspace-brain/issues/1)
-- [#2 Qdrant tenant collection 기반 vector store adapter 붙이기](https://github.com/baekenough/workspace-brain/issues/2)
-- [#3 RabbitMQ ingest worker, retry, DLQ 설계와 구현](https://github.com/baekenough/workspace-brain/issues/3)
-- [#4 OpenAI embedding adapter와 deterministic test seam 추가](https://github.com/baekenough/workspace-brain/issues/4)
-- [#5 Hybrid retrieval, rerank, grounded answer synthesis 구현](https://github.com/baekenough/workspace-brain/issues/5)
-- [#6 Slack manifest-as-code와 interactivity endpoint 추가](https://github.com/baekenough/workspace-brain/issues/6)
-- [#7 최소 Admin surface와 운영 제어 설계](https://github.com/baekenough/workspace-brain/issues/7)
-- [#8 생성 권한, 멤버십 TTL, 감사 정책 확정](https://github.com/baekenough/workspace-brain/issues/8)
-- [#9 운영 관측, 백업, 로컬 의존 서비스 구성](https://github.com/baekenough/workspace-brain/issues/9)
-- [#10 LICENSE와 기여 안내 정리](https://github.com/baekenough/workspace-brain/issues/10)
+## Quick start
 
-## 빠른 시작
+Prerequisites:
+
+- Go `1.25.11` or newer compatible Go 1.25 toolchain.
+- Docker only if you build the container image.
+
+Run the local verification and demo path:
 
 ```bash
 go test ./...
@@ -84,88 +64,287 @@ go test -race ./...
 go run ./cmd/workspace-brain demo
 ```
 
-데모 출력 예시:
+Expected demo shape:
 
 ```text
-tenant=tenant-000001 job=job-000001 answer=아직 실제 RAG 합성은 연결되지 않았습니다. walking skeleton 응답입니다: workspace-brain은 무엇인가?
+tenant=tenant-000001 job=job-000001 answer=...
 ```
 
-## Slack adapter 실행
+The demo uses the local in-memory core. It does not require Slack, OpenAI, PostgreSQL, Qdrant, RabbitMQ, Docker, or any external key.
 
-실제 Slack slash command endpoint를 띄우려면 서명 secret이 필요합니다.
+## Run the server
+
+The server starts only when at least one frontend adapter is configured:
+
+- Set `API_TOKEN` to enable the JSON HTTP API.
+- Set `SLACK_SIGNING_SECRET` to enable the Slack adapter.
+- Set both to expose both adapters in one process.
+
+Start the JSON HTTP adapter locally:
 
 ```bash
-export SLACK_SIGNING_SECRET='...'
+export API_TOKEN='dev-token'
+export ADDR=':8080'
+go run ./cmd/workspace-brain
+```
+
+Check liveness and readiness from another shell:
+
+```bash
+curl -sS http://localhost:8080/healthz
+curl -sS http://localhost:8080/readyz
+```
+
+Expected responses:
+
+```text
+{"status":"ok"}
+{"status":"ready"}
+```
+
+By default readiness returns `ready`. If `READINESS_REQUIRED=true`, readiness also checks configured local dependencies such as `DATA_PATH`.
+
+### Persist local memory across restarts
+
+Set `DATA_PATH` to store the local memory snapshot at `$DATA_PATH/memory.json`:
+
+```bash
+export API_TOKEN='dev-token'
+export DATA_PATH='./var/workspace-brain'
+export READINESS_REQUIRED='true'
+go run ./cmd/workspace-brain
+```
+
+This is local JSON snapshot persistence, not a substitute for managed production storage or backups.
+
+### Run the container image
+
+Build the distroless non-root image:
+
+```bash
+docker build -t workspace-brain:local .
+```
+
+Run the JSON HTTP adapter:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e API_TOKEN=dev-token \
+  workspace-brain:local
+```
+
+Add a writable volume for local snapshot persistence:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e API_TOKEN=dev-token \
+  -e DATA_PATH=/data \
+  -e READINESS_REQUIRED=true \
+  -v workspace-brain-data:/data \
+  workspace-brain:local
+```
+
+## Use the JSON HTTP adapter
+
+The JSON adapter is the simplest non-Slack surface. It uses the same dispatcher and gateway as Slack.
+
+Create a project as an admin:
+
+```bash
+curl -sS http://localhost:8080/api/commands \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"admin","roles":["admin"]},"text":"create Demo"}'
+```
+
+Ingest inline text through the source loader:
+
+```bash
+curl -sS http://localhost:8080/api/commands \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1","roles":["member"]},"text":"ingest text:workspace-brain%20keeps%20tenant%20knowledge%20isolated"}'
+```
+
+Check the deterministic local job ID in a fresh process:
+
+```bash
+curl -sS http://localhost:8080/api/commands \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1","roles":["member"]},"text":"status job-000001"}'
+```
+
+Ask a grounded question:
+
+```bash
+curl -sS http://localhost:8080/api/commands \
+  -H 'Authorization: Bearer dev-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1","roles":["member"]},"text":"ask what does workspace-brain keep isolated?"}'
+```
+
+Expected response shape:
+
+```json
+{"visibility":"private","text":"..."}
+```
+
+The JSON API rejects unknown JSON fields, limits request bodies to 1 MiB, and returns surface-neutral response text with `private` visibility.
+
+### Supported ingest sources
+
+The default server gateway resolves source content before calling the memory core.
+
+| Source shape | Example | Notes |
+|---|---|---|
+| Local file URL | `file:///tmp/demo.md` | Host must be empty or `localhost`; size limit applies. |
+| HTTP(S) URL | `https://example.com/demo.txt` | Requires a 2xx response; timeout and size limit apply. |
+| Text URI | `text:hello%20world` | URL-decoded into inline content. `text://hello` also works for simple host-shaped text. |
+| Raw URI | `raw:hello%20world` | URL-decoded into inline content. `raw://hello` also works for simple host-shaped text. |
+| Plain text fallback | `hello world` | Used when no URI scheme is present. |
+| Inline metadata | `content`, `inline_content`, `inline`, `raw`, `text` | Used by lower-level gateway calls; the command API accepts the text command envelope. |
+
+Default source bounds are 1 MiB and 5 seconds.
+
+## Use the Slack adapter
+
+Slack is one frontend adapter. It does not own the product architecture.
+
+```bash
+export SLACK_SIGNING_SECRET='replace-me'
 export ADMIN_USERS='U123,U456'
 export ADDR=':8080'
 go run ./cmd/workspace-brain
 ```
 
-Endpoint:
+Mounted Slack routes:
 
 ```text
 POST /slack/commands
+POST /slack/interactions
 ```
 
-Slack command 기본값은 `/brain`입니다.
+Generate a Slack app manifest endpoint by adding a public base URL:
 
-## 명령 모델
+```bash
+export PUBLIC_BASE_URL='https://workspace-brain.example.com'
+export SLACK_APP_NAME='Workspace Brain'
+export COMMAND_NAME='brain'
+```
 
-| 명령 | 역할 |
-|---|---|
-| `/brain create <name>` | 프로젝트 생성 + 현재 Slack 채널 binding 생성 |
-| `/brain ingest <source-uri>` | 수집 작업 접수 |
-| `/brain ask <question>` | tenant-scoped 질의 |
-| `/brain discover <query>` | metadata-only 탐색 |
-| `/brain status <job-id>` | 작업 상태 조회 + Core reconcile |
-
-## 저장소 구조
+Then fetch:
 
 ```text
-cmd/workspace-brain/          # 실행 진입점
-pkg/brainapi/                 # 공개 가능한 표면 무관 계약 타입
-internal/control/gateway/     # Control Plane gateway
-internal/control/jobs/        # Control Plane job 상태 저장소
-internal/control/slack/       # Slack slash-command adapter
-internal/core/memory/         # 테스트/데모용 in-memory Data Core
-docs/                         # 세부 아키텍처 문서
+GET /slack/manifest.json
 ```
 
-## 테스트 정책
+Slack registration needs public HTTPS request URLs. The runtime validates that `COMMAND_NAME` has no leading slash or whitespace. It does not persist a command-name lock yet, so keep `COMMAND_NAME` stable after registering the Slack app.
 
-이 프로젝트는 “계약을 먼저 테스트로 고정한다”를 원칙으로 합니다.
+## Configuration
 
-권장 검증:
+Copy `.env.example` when you need a local reference, but remember the Go process reads environment variables from the process environment. It does not load `.env` files by itself.
+
+| Variable | Required | Default | Used by | Notes |
+|---|---:|---|---|---|
+| `ADDR` | No | `:8080` | Server | Listen address. |
+| `API_TOKEN` | Required unless Slack is configured | none | JSON HTTP API | Bearer token for `POST /api/commands`. Use a high-entropy secret outside local demos. |
+| `SLACK_SIGNING_SECRET` | Required unless JSON API is configured | none | Slack adapter | Enables Slack signature verification and Slack routes. |
+| `ADMIN_USERS` | No | empty | Slack adapter | Comma-separated Slack user IDs that receive the `admin` role. |
+| `COMMAND_NAME` | No | `brain` | Slack adapter + manifest | Slash command name without the leading slash. Keep stable after Slack registration. |
+| `PUBLIC_BASE_URL` | No | none | Slack manifest | Enables `GET /slack/manifest.json`; use an absolute public HTTPS URL for Slack registration. |
+| `SLACK_APP_NAME` | No | `workspace-brain` | Slack manifest | Display name in generated Slack manifest JSON. |
+| `DATA_PATH` | No | none | Local memory core | Stores the local memory snapshot at `$DATA_PATH/memory.json` and creates the directory with `0700` permissions. |
+| `READINESS_REQUIRED` | No | `false` | Ops | When true, readiness checks configured local dependencies such as `DATA_PATH`. |
+| `HTTP_READ_HEADER_TIMEOUT` | No | `5s` | Server | Go duration for request-header read timeout. |
+| `HTTP_READ_TIMEOUT` | No | `15s` | Server | Go duration for full request read timeout. |
+| `HTTP_WRITE_TIMEOUT` | No | `30s` | Server | Go duration for response write timeout. |
+| `HTTP_IDLE_TIMEOUT` | No | `60s` | Server | Go duration for keep-alive idle timeout. |
+| `HTTP_SHUTDOWN_TIMEOUT` | No | `10s` | Server | Go duration for graceful shutdown. |
+| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` in the optional client | Optional provider seam | Read by `internal/core/ai.OpenAIConfigFromEnv`; not wired into the default server path. |
+| `OPENAI_API_KEY` | No | none | Optional provider seam | Required only when constructing the optional OpenAI-compatible client. |
+| `OPENAI_EMBEDDING_MODEL` | No | none | Optional provider seam | Required only for optional embedding calls. |
+| `OPENAI_RESPONSE_MODEL` | No | none | Optional provider seam | Required only for optional response calls. |
+| `OPENAI_ORG_ID` | No | none | Optional provider seam | Optional provider header. |
+| `OPENAI_PROJECT_ID` | No | none | Optional provider seam | Optional provider header. |
+
+Timeout values use Go duration syntax such as `5s` or `1m`.
+
+## Command model
+
+Every frontend adapter sends the same text command model to the dispatcher.
+
+| Command | Role required | Result |
+|---|---|---|
+| `create <name>` | `admin` | Create a tenant project and bind the adapter-provided location. |
+| `ingest <source-uri>` | `member` or `admin` | Load supported source content and index it in the tenant memory core. |
+| `ask <question>` | `member` or `admin` | Return a grounded answer with sources/spans when evidence exists. |
+| `discover <query>` | `member` or `admin` | Return metadata-only discovery results. |
+| `status <job-id>` | `member` or `admin` | Read/reconcile tenant-scoped job state. |
+| `admin on|off <tenant-id>` | `admin` | Toggle tenant serving state. |
+
+## Repository layout
+
+```text
+cmd/workspace-brain/          # server and demo wiring
+pkg/brainapi/                 # surface-neutral public contract types
+internal/control/frontend/    # shared command dispatcher
+internal/control/gateway/     # binding, auth, jobs, source loading, core orchestration
+internal/control/httpapi/     # JSON HTTP frontend adapter
+internal/control/jobs/        # control-plane job ledger
+internal/control/ops/         # health/readiness endpoints
+internal/control/slack/       # Slack command/interactivity/manifest adapter
+internal/control/sources/     # bounded source loader for ingest metadata/content
+internal/core/ai/             # optional local/OpenAI-compatible provider seams
+internal/core/memory/         # local in-memory RAG core and JSON persistence
+internal/platform/config/     # typed environment config
+internal/platform/server/     # hardened HTTP server helper
+docs/                         # architecture and deployment notes
+```
+
+The `omcustom/gpt-codex` directory contains agent definitions and instructions. The application development target is the repository root shown above.
+
+## Quality gates
+
+Run these before release:
 
 ```bash
 go test ./...
 go test -race ./...
+go vet ./...
 ./scripts/check-coverage.sh coverage.out
 ```
 
-현재 기준은 **statement coverage 100.0% 필수**입니다. 100.0% 미만이면 CI가 실패합니다.
+`./scripts/check-coverage.sh` runs `go test ./... -coverprofile=coverage.out` and fails unless total coverage is exactly `100.0%`. CI also runs `govulncheck ./...`.
 
-CI는 다음을 실행합니다.
+For container changes, also run:
 
-- `go test ./...`
-- `go test -race ./...`
-- coverage 100.0% 강제
-- `govulncheck ./...`
+```bash
+docker build -t workspace-brain:local .
+```
 
-## 아키텍처 문서
+## Production adapter roadmap
 
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — 구현 기준 아키텍처 요약
-- [docs/workspace-brain-control-plane-architecture.md](./docs/workspace-brain-control-plane-architecture.md) — Control Plane 설계
-- [docs/workspace-brain-data-architecture.md](./docs/workspace-brain-data-architecture.md) — Data Core 설계
+The local runtime intentionally needs no managed services. Production deployments can replace local seams behind the same contracts:
 
-## 공개 포지션
+- durable catalog, binding, and job persistence beyond the local JSON memory snapshot
+- PostgreSQL + row-level security for tenant catalog/content storage
+- Qdrant or equivalent tenant-scoped vector store
+- RabbitMQ or equivalent retry/DLQ ingest workers
+- optional OpenAI/OpenAI-compatible embedding and synthesis adapters with deterministic test seams
+- hybrid retrieval/rerank and richer grounded synthesis
+- Web/CLI/Admin frontend adapters
+- audit log, backup, and observability exporters
+- Compose/orchestrator manifests and runtime health checks around the committed non-root Dockerfile
 
-이 저장소를 가장 정확히 소개하면 다음과 같습니다.
+## Documentation index
 
-> A Go walking skeleton for a multi-tenant RAG control plane and data-core contract, with strict contract and isolation tests.
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — boundary-focused implementation architecture.
+- [docs/deployment.md](./docs/deployment.md) — deployment modes, environment contract, and production readiness checklist.
+- [docs/workspace-brain-control-plane-architecture.md](./docs/workspace-brain-control-plane-architecture.md) — control-plane design notes.
+- [docs/workspace-brain-data-architecture.md](./docs/workspace-brain-data-architecture.md) — data-core design notes.
+- [AGENTS.md](./AGENTS.md) — repository agent operating contract.
 
-즉, **완성형 Slack RAG 봇**이 아니라 **계약, 경계, 격리, 테스트를 먼저 고정한 초기 아키텍처 구현체**입니다. 실제 저장소와 모델 연동은 이 골격 위에 단계적으로 붙입니다.
+## License
 
-## 라이선스
-
-아직 라이선스를 확정하지 않았습니다. 공개 배포 전 `LICENSE`를 명시하세요.
+License is not finalized yet. Add `LICENSE` before public distribution.

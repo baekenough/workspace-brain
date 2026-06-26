@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
+	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
@@ -109,6 +110,75 @@ func TestGatewayIngestMarksFailedOnCoreError(t *testing.T) {
 	}
 }
 
+func TestGatewayIngestInjectsLoadedContent(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	store := jobs.NewStore()
+	gw, err := New(core, RoleAuthorizer{}, store, WithJobIDGenerator(staticJobID("job-loaded")), WithSourceLoader(fakeSourceLoader{loaded: sources.LoadedSource{
+		Source:   brainapi.SourceRef{URI: "file://loaded.txt", Name: "loaded.txt", MimeType: "text/plain"},
+		Metadata: map[string]string{"content": "loaded content", "origin": "loader"},
+	}}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = gw.Ingest(context.Background(), IngestCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{ID: "U1", Roles: []string{"member"}},
+		Source:     brainapi.SourceRef{URI: "file://source.txt"},
+		Metadata:   map[string]string{"origin": "cmd"},
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if core.ingested.Metadata["content"] != "loaded content" || core.ingested.Metadata["origin"] != "loader" {
+		t.Fatalf("metadata = %+v", core.ingested.Metadata)
+	}
+	if core.ingested.Source.Name != "loaded.txt" {
+		t.Fatalf("source = %+v", core.ingested.Source)
+	}
+}
+
+func TestGatewayIngestMarksFailedOnLoaderError(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	store := jobs.NewStore()
+	loaderErr := brainapi.E(brainapi.KindInvalid, "source_load", "bad source", nil)
+	gw, err := New(core, RoleAuthorizer{}, store, WithJobIDGenerator(staticJobID("job-loader-failed")), WithSourceLoader(fakeSourceLoader{err: loaderErr}))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = gw.Ingest(context.Background(), IngestCommand{BindingKey: "slack:channel:C1", Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, Source: brainapi.SourceRef{URI: "file://bad"}})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	if core.ingested.JobID != "" {
+		t.Fatalf("core ingest should not run: %+v", core.ingested)
+	}
+	snapshot, snapErr := store.Snapshot("tenant-1", "job-loader-failed")
+	if snapErr != nil {
+		t.Fatalf("Snapshot: %v", snapErr)
+	}
+	if snapshot.Status != brainapi.JobFailed || snapshot.Error != loaderErr.Error() {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestGatewayIngestWithoutLoaderKeepsMetadataFallback(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore(), WithJobIDGenerator(staticJobID("job-no-loader")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, err = gw.Ingest(context.Background(), IngestCommand{BindingKey: "slack:channel:C1", Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, Source: brainapi.SourceRef{URI: "file://a.pdf", Name: "a.pdf"}})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if core.ingested.Metadata != nil {
+		t.Fatalf("metadata = %+v", core.ingested.Metadata)
+	}
+}
+
 func TestGatewayStatusCanReconcileCore(t *testing.T) {
 	t.Parallel()
 	core := newFakeCore()
@@ -148,13 +218,16 @@ type staticJobID string
 func (s staticJobID) NewJobID() brainapi.JobID { return brainapi.JobID(s) }
 
 type fakeCore struct {
-	binding    brainapi.TenantID
-	resolveErr error
-	created    brainapi.CreateProjectRequest
-	createErr  error
-	ingested   brainapi.IngestRequest
-	ingestErr  error
-	status     brainapi.JobSnapshot
+	binding     brainapi.TenantID
+	resolveErr  error
+	created     brainapi.CreateProjectRequest
+	createErr   error
+	ingested    brainapi.IngestRequest
+	ingestErr   error
+	status      brainapi.JobSnapshot
+	stateTenant brainapi.TenantID
+	state       brainapi.ProjectState
+	stateErr    error
 }
 
 func newFakeCore() *fakeCore { return &fakeCore{binding: "tenant-1"} }
@@ -182,8 +255,10 @@ func (f *fakeCore) Query(context.Context, brainapi.QueryRequest) (brainapi.Query
 func (f *fakeCore) Discover(context.Context, brainapi.DiscoverRequest) (brainapi.DiscoverResponse, error) {
 	return brainapi.DiscoverResponse{}, nil
 }
-func (f *fakeCore) SetProjectState(context.Context, brainapi.TenantID, brainapi.ProjectState) error {
-	return nil
+func (f *fakeCore) SetProjectState(_ context.Context, tenantID brainapi.TenantID, state brainapi.ProjectState) error {
+	f.stateTenant = tenantID
+	f.state = state
+	return f.stateErr
 }
 
 func TestRoleAuthorizerBranches(t *testing.T) {
@@ -304,6 +379,54 @@ func TestGatewayAskDiscoverStatusAndCallbacks(t *testing.T) {
 	}
 }
 
+func TestGatewaySetProjectState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	core := newFakeCore()
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := gw.SetProjectState(ctx, SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectOff, Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}})
+	if err != nil {
+		t.Fatalf("SetProjectState: %v", err)
+	}
+	if result.TenantID != "tenant-1" || result.State != brainapi.ProjectOff || core.stateTenant != "tenant-1" || core.state != brainapi.ProjectOff {
+		t.Fatalf("result=%+v core tenant=%q state=%q", result, core.stateTenant, core.state)
+	}
+}
+
+func TestGatewaySetProjectStateErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name string
+		core *fakeCore
+		cmd  SetProjectStateCommand
+		kind brainapi.ErrorKind
+	}{
+		{"bad tenant", newFakeCore(), SetProjectStateCommand{TenantID: "bad tenant", State: brainapi.ProjectOn, Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}}, brainapi.KindInvalid},
+		{"bad state", newFakeCore(), SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectState("paused"), Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}}, brainapi.KindInvalid},
+		{"member", newFakeCore(), SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectOn, Principal: brainapi.Principal{ID: "member", Roles: []string{"member"}}}, brainapi.KindUnauthorized},
+		{"not found safe", &fakeCore{binding: "tenant-1", stateErr: brainapi.E(brainapi.KindNotFound, "state", "missing", nil)}, SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectOn, Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}}, brainapi.KindUnauthorized},
+		{"unauthorized safe", &fakeCore{binding: "tenant-1", stateErr: brainapi.E(brainapi.KindUnauthorized, "state", "denied", nil)}, SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectOn, Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}}, brainapi.KindUnauthorized},
+		{"internal", &fakeCore{binding: "tenant-1", stateErr: errors.New("store down")}, SetProjectStateCommand{TenantID: "tenant-1", State: brainapi.ProjectOn, Principal: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}}, brainapi.KindInternal},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gw, err := New(tt.core, RoleAuthorizer{}, jobs.NewStore())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			_, err = gw.SetProjectState(ctx, tt.cmd)
+			if !brainapi.IsKind(err, tt.kind) {
+				t.Fatalf("kind=%q err=%v want=%q", brainapi.KindOf(err), err, tt.kind)
+			}
+		})
+	}
+}
+
 func TestGatewayIngestValidationAndStoreFailure(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -360,4 +483,16 @@ func TestGatewayRemainingErrorBranches(t *testing.T) {
 	if !brainapi.IsKind(err, brainapi.KindInvalid) {
 		t.Fatalf("status bad binding kind=%q err=%v", brainapi.KindOf(err), err)
 	}
+}
+
+type fakeSourceLoader struct {
+	loaded sources.LoadedSource
+	err    error
+}
+
+func (f fakeSourceLoader) Load(context.Context, brainapi.SourceRef, map[string]string) (sources.LoadedSource, error) {
+	if f.err != nil {
+		return sources.LoadedSource{}, f.err
+	}
+	return f.loaded, nil
 }

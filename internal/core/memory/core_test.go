@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -229,5 +231,154 @@ func TestCoreDiscoverOffProject(t *testing.T) {
 	_, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "tenant-a"})
 	if !brainapi.IsKind(err, brainapi.KindConflict) {
 		t.Fatalf("discover off kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+func TestCoreGroundedRetrievalRankingAndFiltering(t *testing.T) {
+	t.Parallel()
+	fixed := time.Date(2026, 6, 24, 0, 0, 0, 0, time.UTC)
+	core := New(WithClock(func() time.Time { return fixed }))
+	ctx := context.Background()
+	mustCreate(t, core, "tenant-a", "api:space:A")
+	mustCreate(t, core, "tenant-b", "api:space:B")
+	long := strings.Repeat("alpha beta gamma ", 60) + "needle tenant alpha"
+	if err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "text://alpha", Name: "alpha-doc", MimeType: "text/plain"}, Metadata: map[string]string{"content": long}}); err != nil {
+		t.Fatalf("Ingest a1: %v", err)
+	}
+	if err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-2", Source: brainapi.SourceRef{URI: "text://beta", Name: "beta-doc", MimeType: "text/plain"}, Metadata: map[string]string{"content": "delta epsilon zeta"}}); err != nil {
+		t.Fatalf("Ingest a2: %v", err)
+	}
+	if err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-b", JobID: "job-1", Source: brainapi.SourceRef{URI: "text://other", Name: "other-doc", MimeType: "text/plain"}, Metadata: map[string]string{"content": "needle from another tenant"}}); err != nil {
+		t.Fatalf("Ingest b: %v", err)
+	}
+	answer, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "needle alpha"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !answer.GroundingAvailable || len(answer.Sources) == 0 || len(answer.GroundedSpans) == 0 {
+		t.Fatalf("answer not grounded: %+v", answer)
+	}
+	if answer.Sources[0].TenantID != "tenant-a" || answer.Sources[0].URI == "text://other" || !strings.Contains(answer.Answer, "근거 기반 응답") {
+		t.Fatalf("answer leaked or malformed: %+v", answer)
+	}
+	discovered, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "tenant-a", Query: "delta"})
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(discovered.Results) != 1 || discovered.Results[0].Title != "beta-doc" || !discovered.Results[0].FreshAt.Equal(fixed) {
+		t.Fatalf("discover filtered = %+v", discovered.Results)
+	}
+	none, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "tenant-a", Query: "missing"})
+	if err != nil {
+		t.Fatalf("Discover missing: %v", err)
+	}
+	if len(none.Results) != 0 {
+		t.Fatalf("unexpected discover results = %+v", none.Results)
+	}
+}
+
+func TestCoreQueryWithoutSourcesAndRetrievalHelpers(t *testing.T) {
+	t.Parallel()
+	core := New()
+	ctx := context.Background()
+	mustCreate(t, core, "tenant-a", "api:space:A")
+	answer, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "anything"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if answer.GroundingAvailable || !strings.Contains(answer.Answer, "수집된 근거가 없습니다") {
+		t.Fatalf("empty answer = %+v", answer)
+	}
+	if got := synthesize("q", nil); !strings.Contains(got, "수집된 근거가 없습니다") {
+		t.Fatalf("synthesize empty = %q", got)
+	}
+	blankDoc := document{source: brainapi.SourceRef{URI: "text://blank", Name: "blank"}, title: "blank", freshAt: time.Unix(0, 0)}
+	blankChunks := chunksFrom("tenant-a", 0, blankDoc, 0)
+	if len(blankChunks) != 1 || blankChunks[0].text != "blank" {
+		t.Fatalf("blank chunks = %+v", blankChunks)
+	}
+	left := map[string]int{"x": 1, "y": 3}
+	right := map[string]int{"x": 2, "y": 1}
+	if got := overlap(left, right); got != 2 {
+		t.Fatalf("overlap = %d", got)
+	}
+	if got := cosine(nilVector(), embed("x")); got != 0 {
+		t.Fatalf("zero cosine = %f", got)
+	}
+	tied := rankChunks("nomatch", []chunk{{text: "a", terms: terms("a"), vector: embed("a")}, {text: "b", terms: terms("b"), vector: embed("b")}})
+	if len(tied) != 2 || tied[0].order != 0 {
+		t.Fatalf("stable rank = %+v", tied)
+	}
+}
+
+func nilVector() []float64 { return make([]float64, embeddingDimensions) }
+
+func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
+	t.Parallel()
+	core := New()
+	core.initErr = errors.New("snapshot unavailable")
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "create project",
+			call: func() error {
+				return core.CreateProject(ctx, brainapi.CreateProjectRequest{TenantID: "tenant-a", BindingKey: "api:space:A", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
+			},
+		},
+		{
+			name: "ingest",
+			call: func() error {
+				return core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "text://a"}})
+			},
+		},
+		{
+			name: "complete job",
+			call: func() error {
+				return core.CompleteJob("tenant-a", "job-1", brainapi.JobCompleted, "", "")
+			},
+		},
+		{
+			name: "job status",
+			call: func() error {
+				_, err := core.JobStatus(ctx, "tenant-a", "job-1")
+				return err
+			},
+		},
+		{
+			name: "query",
+			call: func() error {
+				_, err := core.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "ready?"})
+				return err
+			},
+		},
+		{
+			name: "discover",
+			call: func() error {
+				_, err := core.Discover(ctx, brainapi.DiscoverRequest{TenantID: "tenant-a"})
+				return err
+			},
+		},
+		{
+			name: "set project state",
+			call: func() error {
+				return core.SetProjectState(ctx, "tenant-a", brainapi.ProjectOn)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if !brainapi.IsKind(err, brainapi.KindInternal) {
+				t.Fatalf("ready error kind=%q err=%v", brainapi.KindOf(err), err)
+			}
+			if !strings.Contains(err.Error(), "memory core persistence is unavailable") {
+				t.Fatalf("ready error did not explain persistence failure: %v", err)
+			}
+		})
 	}
 }
