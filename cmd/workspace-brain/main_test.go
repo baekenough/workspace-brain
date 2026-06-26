@@ -18,6 +18,7 @@ import (
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
 	"github.com/sangyi/workspace-brain/internal/core/ai"
+	"github.com/sangyi/workspace-brain/internal/core/memory"
 	"github.com/sangyi/workspace-brain/internal/platform/config"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
@@ -552,6 +553,113 @@ func TestServeHTTPServerDelegatesToPlatformServer(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("serveHTTPServer did not return after cancel")
 	}
+}
+
+// ── OpenAI synthesizer bridge tests ──────────────────────────────────────────
+
+// TestOpenAISynthesizerBridgeHappyPath wires the bridge with ai.LocalClient
+// and verifies the answer, grounded spans, and supplemented spans are set.
+func TestOpenAISynthesizerBridgeHappyPath(t *testing.T) {
+	t.Parallel()
+	bridge := &openAISynthesizerBridge{responder: ai.LocalClient{}}
+	inputs := []memory.SynthesisInput{{Text: "first chunk"}, {Text: "second chunk"}}
+	result, err := bridge.Synthesize(context.Background(), "what is this?", inputs)
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if result.Answer == "" {
+		t.Fatal("expected non-empty answer")
+	}
+	if len(result.GroundedSpans) != 2 {
+		t.Fatalf("grounded spans = %d, want 2", len(result.GroundedSpans))
+	}
+	if result.GroundedSpans[0] != "first chunk" || result.GroundedSpans[1] != "second chunk" {
+		t.Fatalf("grounded spans = %v", result.GroundedSpans)
+	}
+	if len(result.SupplementedSpans) != 1 || result.SupplementedSpans[0] != result.Answer {
+		t.Fatalf("supplemented spans = %v, answer = %q", result.SupplementedSpans, result.Answer)
+	}
+}
+
+// TestOpenAISynthesizerBridgeEmptyInputs checks the no-grounding abstention path.
+func TestOpenAISynthesizerBridgeEmptyInputs(t *testing.T) {
+	t.Parallel()
+	bridge := &openAISynthesizerBridge{responder: ai.LocalClient{}}
+	result, err := bridge.Synthesize(context.Background(), "q", nil)
+	if err != nil {
+		t.Fatalf("Synthesize: %v", err)
+	}
+	if !strings.Contains(result.Answer, "수집된 근거가 없습니다") {
+		t.Fatalf("abstention answer = %q", result.Answer)
+	}
+	if result.GroundedSpans != nil || result.SupplementedSpans != nil {
+		t.Fatalf("expected nil spans for abstention; grounded=%v supplemented=%v", result.GroundedSpans, result.SupplementedSpans)
+	}
+}
+
+// TestOpenAISynthesizerBridgeResponderError confirms that a Responder error
+// surfaces as a Synthesize error without a partial result.
+func TestOpenAISynthesizerBridgeResponderError(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("responder down")
+	bridge := &openAISynthesizerBridge{responder: &alwaysErrResponder{err: boom}}
+	inputs := []memory.SynthesisInput{{Text: "some chunk"}}
+	_, err := bridge.Synthesize(context.Background(), "question", inputs)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+}
+
+// alwaysErrResponder is a test double that always returns an error.
+type alwaysErrResponder struct{ err error }
+
+func (r *alwaysErrResponder) Respond(context.Context, string) (string, error) {
+	return "", r.err
+}
+
+// TestOpenAISynthesizerBridgeWiredViaWithSynthesizer confirms that the bridge
+// can be injected into a memory.Core via WithSynthesizer and that Query
+// returns a non-empty answer produced by the bridge (ai.LocalClient).
+func TestOpenAISynthesizerBridgeWiredViaWithSynthesizer(t *testing.T) {
+	t.Parallel()
+	core, err := newAppCore(config.Config{})
+	if err != nil {
+		t.Fatalf("newAppCore: %v", err)
+	}
+	// Replace synthesizer with the bridge backed by LocalClient.
+	coreSynthesized := memory.New(
+		memory.WithSynthesizer(&openAISynthesizerBridge{responder: ai.LocalClient{}}),
+	)
+	ctx := context.Background()
+	if err := coreSynthesized.CreateProject(ctx, brainapi.CreateProjectRequest{
+		TenantID: "tenant-bridge", BindingKey: "test:space:bridge",
+		OwnerPrincipal: brainapi.Principal{ID: "owner"},
+	}); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := coreSynthesized.Ingest(ctx, brainapi.IngestRequest{
+		TenantID: "tenant-bridge", JobID: "job-1",
+		Source:   brainapi.SourceRef{URI: "file://test.txt"},
+		Metadata: map[string]string{"content": "workspace brain knowledge"},
+	}); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	resp, err := coreSynthesized.Query(ctx, brainapi.QueryRequest{
+		TenantID: "tenant-bridge", Question: "knowledge",
+	})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if resp.Answer == "" {
+		t.Fatal("expected non-empty answer from bridge")
+	}
+	if !resp.GroundingAvailable {
+		t.Fatal("expected grounding available")
+	}
+	if len(resp.SupplementedSpans) == 0 {
+		t.Fatal("expected supplemented spans from bridge synthesizer")
+	}
+	_ = core // core was allocated; keep it to satisfy the compiler
 }
 
 // ── OpenAI embedder bridge tests ─────────────────────────────────────────────

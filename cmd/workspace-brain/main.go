@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
@@ -105,6 +106,52 @@ func defaultNewAppGateway(core brainapi.Core, authorizer gateway.Authorizer, sto
 // openAIEmbeddingDimensions is the MRL target dimension for text-embedding-3-*
 // models. Vectors longer than this are truncated; shorter vectors are an error.
 const openAIEmbeddingDimensions = 1024
+
+// openAISynthesizerBridge adapts an ai.Responder to the memory.Synthesizer
+// interface. The bridge lives in the composition root (cmd/main.go) so that
+// internal/core/memory never imports internal/core/ai.
+//
+// Grounded spans are the raw retrieved passages. The model's synthesised output
+// is reported as a supplemented span, representing content the model generated
+// beyond direct quotation of the sources.
+type openAISynthesizerBridge struct {
+	responder ai.Responder
+}
+
+// Synthesize implements memory.Synthesizer. It builds a Korean prompt from
+// the retrieved passages and the question, calls the Responder, and
+// classifies the model output as a supplemented span while listing all
+// input passages as grounded spans. An empty inputs slice returns an
+// abstention without calling the Responder.
+func (b *openAISynthesizerBridge) Synthesize(ctx context.Context, question string, inputs []memory.SynthesisInput) (memory.SynthesisResult, error) {
+	if len(inputs) == 0 {
+		return memory.SynthesisResult{Answer: "수집된 근거가 없습니다: " + question}, nil
+	}
+	var sb strings.Builder
+	sb.WriteString("다음 내용을 기반으로 질문에 답변하시오.\n\n")
+	for i, inp := range inputs {
+		fmt.Fprintf(&sb, "[%d] %s\n", i+1, inp.Text)
+	}
+	fmt.Fprintf(&sb, "\n질문: %s\n답변:", question)
+
+	answer, err := b.responder.Respond(ctx, sb.String())
+	if err != nil {
+		return memory.SynthesisResult{}, err
+	}
+
+	groundedSpans := make([]string, len(inputs))
+	for i, inp := range inputs {
+		groundedSpans[i] = inp.Text
+	}
+	return memory.SynthesisResult{
+		Answer:            answer,
+		GroundedSpans:     groundedSpans,
+		SupplementedSpans: []string{answer},
+	}, nil
+}
+
+// compile-time check: openAISynthesizerBridge satisfies memory.Synthesizer.
+var _ memory.Synthesizer = (*openAISynthesizerBridge)(nil)
 
 // openAIEmbedderBridge adapts an *ai.OpenAIClient to the memory.Embedder
 // interface. The bridge is placed in the composition root so that

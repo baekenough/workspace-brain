@@ -42,6 +42,34 @@ type VectorStore interface {
 	Replace(tenantID brainapi.TenantID, chunks []chunk)
 }
 
+// SynthesisInput is a single retrieved passage passed to a Synthesizer.
+type SynthesisInput struct {
+	Text string
+}
+
+// SynthesisResult is the output of a Synthesizer: the answer text and a
+// breakdown of content that came directly from retrieved passages (grounded)
+// versus content the model generated beyond those passages (supplemented).
+type SynthesisResult struct {
+	Answer            string
+	GroundedSpans     []string
+	SupplementedSpans []string
+}
+
+// Synthesizer generates a grounded answer from retrieved passages.
+// Implementations must handle an empty inputs slice (return abstention).
+// Memory never imports internal/core/ai; adapters are bridged in cmd/main.go.
+type Synthesizer interface {
+	Synthesize(ctx context.Context, question string, inputs []SynthesisInput) (SynthesisResult, error)
+}
+
+// Reranker orders candidate chunk texts for a question, returning their
+// original indices (into the candidateTexts slice) in descending relevance order.
+// The default localReranker applies the overlap×2 + cosine formula.
+type Reranker interface {
+	Rerank(question string, candidateTexts []string) []int
+}
+
 // ─── Default (local) implementations ────────────────────────────────────────
 
 // localEmbedder is the default Embedder. It uses the deterministic FNV-1a
@@ -87,6 +115,60 @@ func (s *inMemoryVectorStore) Replace(tenantID brainapi.TenantID, chunks []chunk
 	s.chunks[tenantID] = dst
 }
 
+// localSynthesizer is the default Synthesizer. It produces a deterministic
+// answer from the top retrieved passage without any external API calls.
+// All retrieved passages are reported as grounded; SupplementedSpans is nil
+// because no model-generated content is added beyond the direct citation.
+type localSynthesizer struct{}
+
+func (localSynthesizer) Synthesize(_ context.Context, question string, inputs []SynthesisInput) (SynthesisResult, error) {
+	if len(inputs) == 0 {
+		return SynthesisResult{Answer: "수집된 근거가 없습니다: " + question}, nil
+	}
+	spans := make([]string, len(inputs))
+	for i, inp := range inputs {
+		spans[i] = inp.Text
+	}
+	return SynthesisResult{
+		Answer:        "근거 기반 응답: " + inputs[0].Text,
+		GroundedSpans: spans,
+		// SupplementedSpans is nil: the answer is a direct citation, not model-supplemented.
+	}, nil
+}
+
+// localReranker is the default Reranker. It applies the overlap×2 + cosine
+// formula – the same scoring used by inMemoryVectorStore.Search – so the
+// retrieval order from VectorStore is preserved when the Reranker is not
+// replaced. Injecting a cross-encoder implementation upgrades quality here
+// without touching any other part of the pipeline.
+type localReranker struct{}
+
+func (localReranker) Rerank(question string, candidateTexts []string) []int {
+	qTerms := terms(question)
+	qVec := embed(question)
+	type item struct {
+		idx   int
+		score float64
+	}
+	items := make([]item, len(candidateTexts))
+	for i, text := range candidateTexts {
+		cTerms := terms(text)
+		cVec := embed(text)
+		items[i] = item{
+			idx:   i,
+			score: float64(overlap(qTerms, cTerms))*2 + cosine(qVec, cVec),
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].score > items[j].score
+	})
+	result := make([]int, len(items))
+	for i, it := range items {
+		result[i] = it.idx
+	}
+	return result
+}
+
 // ─── Core ────────────────────────────────────────────────────────────────────
 
 // Core is a thread-safe in-memory implementation of brainapi.Core.
@@ -97,6 +179,9 @@ type Core struct {
 	initErr         error
 	embedder        Embedder
 	vectorStore     VectorStore
+	synthesizer     Synthesizer
+	reranker        Reranker
+	topN            int
 	bindings        map[brainapi.BindingKey]brainapi.TenantID
 	projects        map[brainapi.TenantID]project
 	jobs            map[string]brainapi.JobSnapshot
@@ -174,6 +259,38 @@ func WithVectorStore(vs VectorStore) Option {
 	}
 }
 
+// WithSynthesizer replaces the default localSynthesizer with s.
+// A nil s is silently ignored (the default is kept).
+func WithSynthesizer(s Synthesizer) Option {
+	return func(c *Core) {
+		if s != nil {
+			c.synthesizer = s
+		}
+	}
+}
+
+// WithReranker replaces the default localReranker with r.
+// A nil r is silently ignored (the default is kept).
+func WithReranker(r Reranker) Option {
+	return func(c *Core) {
+		if r != nil {
+			c.reranker = r
+		}
+	}
+}
+
+// WithTopN sets the number of top-ranked chunks returned by Query.
+// The Core fetches topN×3 candidates from the VectorStore and then applies
+// the Reranker before selecting the final topN chunks. Values less than 1
+// are silently ignored (the default of 3 is kept).
+func WithTopN(n int) Option {
+	return func(c *Core) {
+		if n >= 1 {
+			c.topN = n
+		}
+	}
+}
+
 // ─── Constructors ────────────────────────────────────────────────────────────
 
 // New creates an empty in-memory data core.
@@ -200,6 +317,9 @@ func newCore(opts ...Option) *Core {
 		now:         time.Now,
 		embedder:    localEmbedder{},
 		vectorStore: newInMemoryVectorStore(),
+		synthesizer: localSynthesizer{},
+		reranker:    localReranker{},
+		topN:        3,
 		bindings:    make(map[brainapi.BindingKey]brainapi.TenantID),
 		projects:    make(map[brainapi.TenantID]project),
 		jobs:        make(map[string]brainapi.JobSnapshot),
@@ -358,9 +478,17 @@ func (c *Core) JobStatus(ctx context.Context, tenantID brainapi.TenantID, jobID 
 	return snapshot, nil
 }
 
-// Query retrieves tenant-scoped chunks and returns a deterministic grounded answer.
+// Query retrieves tenant-scoped chunks and returns a grounded answer.
+//
+// Pipeline:
+//  1. VectorStore.Search fetches topN×3 candidates (hybrid BM25+cosine retrieval).
+//  2. Reranker.Rerank re-scores and orders the candidates.
+//  3. The top-N chunk texts from the reranked list are passed to the Synthesizer.
+//  4. Synthesizer.Synthesize returns the answer, grounded spans, and any
+//     model-supplemented spans.
+//
+// All three seams default to local (deterministic, no-network) implementations.
 func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.QueryResponse, error) {
-	_ = ctx
 	if err := brainapi.ValidateTenantID(req.TenantID); err != nil {
 		return brainapi.QueryResponse{}, err
 	}
@@ -376,17 +504,53 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	if err := c.requireProjectLocked(req.TenantID, "query"); err != nil {
 		return brainapi.QueryResponse{}, err
 	}
+
 	questionTerms := terms(question)
 	questionVector := c.embedder.Embed(question)
-	top := c.vectorStore.Search(req.TenantID, questionTerms, questionVector, 3)
-	if len(top) == 0 {
+
+	// Fetch a candidate set larger than topN so the Reranker has room to
+	// reorder. The default localReranker reproduces the VectorStore ordering,
+	// so for local tests the final top-N is identical to the previous behaviour.
+	candidateN := c.topN * 3
+	candidates := c.vectorStore.Search(req.TenantID, questionTerms, questionVector, candidateN)
+	if len(candidates) == 0 {
 		return brainapi.QueryResponse{Answer: "수집된 근거가 없습니다: " + question, GroundingAvailable: false}, nil
 	}
+
+	// Rerank the candidates.
+	candidateTexts := make([]string, len(candidates))
+	for i, ch := range candidates {
+		candidateTexts[i] = ch.text
+	}
+	ranked := c.reranker.Rerank(question, candidateTexts)
+
+	// Select top-N from the reranked indices, skipping out-of-range values
+	// that a custom Reranker implementation might return.
+	top := make([]chunk, 0, c.topN)
+	for _, idx := range ranked {
+		if len(top) >= c.topN {
+			break
+		}
+		if idx < 0 || idx >= len(candidates) {
+			continue
+		}
+		top = append(top, candidates[idx])
+	}
+
+	// Synthesize the grounded answer.
+	inputs := make([]SynthesisInput, len(top))
+	for i, ch := range top {
+		inputs[i] = SynthesisInput{Text: ch.text}
+	}
+	synthesis, err := c.synthesizer.Synthesize(ctx, question, inputs)
+	if err != nil {
+		return brainapi.QueryResponse{}, err
+	}
 	return brainapi.QueryResponse{
-		Answer:             synthesize(question, top),
+		Answer:             synthesis.Answer,
 		Sources:            uniqueSources(top),
-		GroundedSpans:      groundedSpans(top),
-		SupplementedSpans:  nil,
+		GroundedSpans:      synthesis.GroundedSpans,
+		SupplementedSpans:  synthesis.SupplementedSpans,
 		GroundingAvailable: true,
 	}, nil
 }
@@ -541,13 +705,6 @@ func topChunks(ranked []scoredChunk, limit int) []chunk {
 	return out
 }
 
-func synthesize(question string, chunks []chunk) string {
-	if len(chunks) == 0 {
-		return "수집된 근거가 없습니다: " + question
-	}
-	return "근거 기반 응답: " + chunks[0].text
-}
-
 func uniqueSources(chunks []chunk) []brainapi.Source {
 	seen := make(map[string]bool)
 	sources := make([]brainapi.Source, 0, len(chunks))
@@ -560,14 +717,6 @@ func uniqueSources(chunks []chunk) []brainapi.Source {
 		sources = append(sources, ch.source)
 	}
 	return sources
-}
-
-func groundedSpans(chunks []chunk) []string {
-	spans := make([]string, 0, len(chunks))
-	for _, ch := range chunks {
-		spans = append(spans, ch.text)
-	}
-	return spans
 }
 
 func terms(text string) map[string]int {
