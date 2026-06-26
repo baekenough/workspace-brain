@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
+	"github.com/sangyi/workspace-brain/internal/core/ai"
 	"github.com/sangyi/workspace-brain/internal/platform/config"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
@@ -549,6 +551,169 @@ func TestServeHTTPServerDelegatesToPlatformServer(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("serveHTTPServer did not return after cancel")
+	}
+}
+
+// ── OpenAI embedder bridge tests ─────────────────────────────────────────────
+
+func make1024DimJSON() []byte {
+	vec := make([]float64, openAIEmbeddingDimensions)
+	for i := range vec {
+		vec[i] = float64(i + 1)
+	}
+	b, _ := json.Marshal(map[string]any{
+		"data": []any{map[string]any{"embedding": vec}},
+	})
+	return b
+}
+
+func TestOpenAIEmbedderBridgeHappyPath(t *testing.T) {
+	t.Parallel()
+	body := make1024DimJSON()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	client, err := ai.NewOpenAIClient(ai.OpenAIConfig{
+		BaseURL:             server.URL,
+		APIKey:              "key",
+		EmbeddingModel:      "embed",
+		HTTPClient:          server.Client(),
+		EmbeddingDimensions: openAIEmbeddingDimensions,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	bridge := &openAIEmbedderBridge{client: client, dims: openAIEmbeddingDimensions}
+	result := bridge.Embed("hello world")
+	if len(result) != openAIEmbeddingDimensions {
+		t.Fatalf("len(result)=%d, want %d", len(result), openAIEmbeddingDimensions)
+	}
+	if result[0] != 1 || result[openAIEmbeddingDimensions-1] != float64(openAIEmbeddingDimensions) {
+		t.Fatalf("unexpected vector values: [0]=%v [last]=%v", result[0], result[openAIEmbeddingDimensions-1])
+	}
+}
+
+func TestOpenAIEmbedderBridgeReturnsZeroVecOnClientError(t *testing.T) {
+	t.Parallel()
+	// 418 is not retried — client returns an error immediately.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	client, _ := ai.NewOpenAIClient(ai.OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", EmbeddingModel: "embed",
+		HTTPClient: server.Client(),
+	})
+	bridge := &openAIEmbedderBridge{client: client, dims: openAIEmbeddingDimensions}
+	result := bridge.Embed("hello")
+	if len(result) != openAIEmbeddingDimensions {
+		t.Fatalf("len=%d, want %d", len(result), openAIEmbeddingDimensions)
+	}
+	for _, v := range result {
+		if v != 0 {
+			t.Fatalf("expected zero vector on error, got non-zero element")
+		}
+	}
+}
+
+func TestOpenAIEmbedderBridgeReturnsZeroVecOnEmptyResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+	client, _ := ai.NewOpenAIClient(ai.OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", EmbeddingModel: "embed",
+		HTTPClient: server.Client(),
+	})
+	bridge := &openAIEmbedderBridge{client: client, dims: openAIEmbeddingDimensions}
+	result := bridge.Embed("hello")
+	if len(result) != openAIEmbeddingDimensions {
+		t.Fatalf("len=%d, want %d", len(result), openAIEmbeddingDimensions)
+	}
+}
+
+func TestOpenAIEmbedderOptionReturnsNilWhenAPIKeyMissing(t *testing.T) {
+	t.Parallel()
+	opts := openAIEmbedderOption(config.Config{OpenAIEmbeddingModel: "text-embedding-3-small"})
+	if opts != nil {
+		t.Fatalf("expected nil options when API key is missing, got %v", opts)
+	}
+}
+
+func TestOpenAIEmbedderOptionReturnsNilWhenModelMissing(t *testing.T) {
+	t.Parallel()
+	opts := openAIEmbedderOption(config.Config{OpenAIAPIKey: "sk-test"})
+	if opts != nil {
+		t.Fatalf("expected nil options when embedding model is missing, got %v", opts)
+	}
+}
+
+func TestOpenAIEmbedderOptionReturnsBridgeWhenFullyConfigured(t *testing.T) {
+	t.Parallel()
+	opts := openAIEmbedderOption(config.Config{
+		OpenAIAPIKey:         "sk-test",
+		OpenAIEmbeddingModel: "text-embedding-3-small",
+		OpenAIBaseURL:        "https://api.openai.com/v1",
+	})
+	if len(opts) != 1 {
+		t.Fatalf("expected 1 option, got %d", len(opts))
+	}
+}
+
+func TestDefaultNewAppCoreUsesLocalEmbedderWhenOpenAINotConfigured(t *testing.T) {
+	t.Parallel()
+	core, err := defaultNewAppCore(config.Config{})
+	if err != nil {
+		t.Fatalf("defaultNewAppCore: %v", err)
+	}
+	if core == nil {
+		t.Fatal("expected non-nil core")
+	}
+}
+
+func TestDefaultNewAppCoreUsesOpenAIEmbedderWhenConfigured(t *testing.T) {
+	t.Parallel()
+	// The bridge is created; we verify the core is non-nil without making
+	// real network calls (Embed is only called on Ingest/Query).
+	cfg := config.Config{
+		OpenAIAPIKey:         "sk-test",
+		OpenAIEmbeddingModel: "text-embedding-3-small",
+	}
+	core, err := defaultNewAppCore(cfg)
+	if err != nil {
+		t.Fatalf("defaultNewAppCore: %v", err)
+	}
+	if core == nil {
+		t.Fatal("expected non-nil core")
+	}
+}
+
+func TestRunServerWiresOpenAIEmbedderFromEnv(t *testing.T) {
+	t.Parallel()
+	// Verify that OpenAI env vars flow through FromEnv → defaultNewAppCore
+	// without error. The bridge only makes network calls when Embed is invoked.
+	called := false
+	err := runServer(context.Background(), func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "OPENAI_API_KEY":
+			return "sk-test"
+		case "OPENAI_EMBEDDING_MODEL":
+			return "text-embedding-3-small"
+		default:
+			return ""
+		}
+	}, func(_ context.Context, _ *http.Server, _ config.Config) error {
+		called = true
+		return errors.New("stop")
+	})
+	if err == nil || err.Error() != "stop" || !called {
+		t.Fatalf("err=%v called=%v", err, called)
 	}
 }
 

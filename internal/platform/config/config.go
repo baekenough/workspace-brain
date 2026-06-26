@@ -28,6 +28,14 @@ type Config struct {
 	WriteTimeout       time.Duration
 	IdleTimeout        time.Duration
 	ShutdownTimeout    time.Duration
+	// OpenAI embedding fields — all optional. When OpenAIAPIKey and
+	// OpenAIEmbeddingModel are both non-empty the server uses the
+	// OpenAI-backed embedder; otherwise the local FNV embedder is used.
+	OpenAIAPIKey         string
+	OpenAIBaseURL        string
+	OpenAIEmbeddingModel string
+	OpenAIOrganizationID string
+	OpenAIProjectID      string
 }
 
 const (
@@ -47,14 +55,19 @@ func FromEnv(getenv LookupFunc) (Config, error) {
 		getenv = func(string) string { return "" }
 	}
 	cfg := Config{
-		Addr:               envOr(getenv, "ADDR", defaultAddr),
-		APIToken:           strings.TrimSpace(getenv("API_TOKEN")),
-		SlackSigningSecret: strings.TrimSpace(getenv("SLACK_SIGNING_SECRET")),
-		AdminUsers:         splitList(getenv("ADMIN_USERS")),
-		PublicBaseURL:      strings.TrimRight(strings.TrimSpace(getenv("PUBLIC_BASE_URL")), "/"),
-		CommandName:        envOr(getenv, "COMMAND_NAME", defaultCommandName),
-		SlackAppName:       envOr(getenv, "SLACK_APP_NAME", defaultSlackAppName),
-		DataPath:           strings.TrimSpace(getenv("DATA_PATH")),
+		Addr:                 envOr(getenv, "ADDR", defaultAddr),
+		APIToken:             strings.TrimSpace(getenv("API_TOKEN")),
+		SlackSigningSecret:   strings.TrimSpace(getenv("SLACK_SIGNING_SECRET")),
+		AdminUsers:           splitList(getenv("ADMIN_USERS")),
+		PublicBaseURL:        strings.TrimRight(strings.TrimSpace(getenv("PUBLIC_BASE_URL")), "/"),
+		CommandName:          envOr(getenv, "COMMAND_NAME", defaultCommandName),
+		SlackAppName:         envOr(getenv, "SLACK_APP_NAME", defaultSlackAppName),
+		DataPath:             strings.TrimSpace(getenv("DATA_PATH")),
+		OpenAIAPIKey:         strings.TrimSpace(getenv("OPENAI_API_KEY")),
+		OpenAIBaseURL:        strings.TrimSpace(getenv("OPENAI_BASE_URL")),
+		OpenAIEmbeddingModel: strings.TrimSpace(getenv("OPENAI_EMBEDDING_MODEL")),
+		OpenAIOrganizationID: strings.TrimSpace(getenv("OPENAI_ORG_ID")),
+		OpenAIProjectID:      strings.TrimSpace(getenv("OPENAI_PROJECT_ID")),
 	}
 	var err error
 	if cfg.ReadinessRequired, err = parseBool(getenv, "READINESS_REQUIRED", false); err != nil {

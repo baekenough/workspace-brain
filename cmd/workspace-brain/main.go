@@ -17,6 +17,7 @@ import (
 	"github.com/sangyi/workspace-brain/internal/control/ops"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
+	"github.com/sangyi/workspace-brain/internal/core/ai"
 	"github.com/sangyi/workspace-brain/internal/core/memory"
 	"github.com/sangyi/workspace-brain/internal/platform/config"
 	platformserver "github.com/sangyi/workspace-brain/internal/platform/server"
@@ -89,11 +90,56 @@ func defaultNewAppGateway(core brainapi.Core, authorizer gateway.Authorizer, sto
 	return gateway.New(core, authorizer, store, gateway.WithSourceLoader(sources.NewLoader()))
 }
 
-func defaultNewAppCore(cfg config.Config) (demoCore, error) {
-	if cfg.DataPath == "" {
-		return memory.New(), nil
+// openAIEmbeddingDimensions is the MRL target dimension for text-embedding-3-*
+// models. Vectors longer than this are truncated; shorter vectors are an error.
+const openAIEmbeddingDimensions = 1024
+
+// openAIEmbedderBridge adapts an *ai.OpenAIClient to the memory.Embedder
+// interface. The bridge is placed in the composition root so that
+// internal/core/memory never imports internal/core/ai.
+//
+// On any error from the OpenAI API, Embed returns a zero vector of length dims
+// so the embedding call always produces a valid (if uninformative) vector.
+type openAIEmbedderBridge struct {
+	client *ai.OpenAIClient
+	dims   int
+}
+
+// Embed implements memory.Embedder. It calls the OpenAI /embeddings endpoint
+// with a background context and returns the first embedding vector. On error
+// or an empty response it returns a zero vector.
+func (b *openAIEmbedderBridge) Embed(text string) []float64 {
+	vecs, err := b.client.Embed(context.Background(), []string{text})
+	if err != nil || len(vecs) == 0 {
+		return make([]float64, b.dims)
 	}
-	return memory.NewPersistent(filepath.Join(cfg.DataPath, "memory.json"))
+	return vecs[0]
+}
+
+// openAIEmbedderOption returns a memory.WithEmbedder option wired to the real
+// OpenAI embedding endpoint when both OPENAI_API_KEY and OPENAI_EMBEDDING_MODEL
+// are configured. It returns nil (no option, local FNV embedder used) otherwise.
+func openAIEmbedderOption(cfg config.Config) []memory.Option {
+	if cfg.OpenAIAPIKey == "" || cfg.OpenAIEmbeddingModel == "" {
+		return nil
+	}
+	client, _ := ai.NewOpenAIClient(ai.OpenAIConfig{
+		BaseURL:             cfg.OpenAIBaseURL,
+		APIKey:              cfg.OpenAIAPIKey,
+		EmbeddingModel:      cfg.OpenAIEmbeddingModel,
+		OrganizationID:      cfg.OpenAIOrganizationID,
+		ProjectID:           cfg.OpenAIProjectID,
+		EmbeddingDimensions: openAIEmbeddingDimensions,
+	})
+	return []memory.Option{memory.WithEmbedder(&openAIEmbedderBridge{client: client, dims: openAIEmbeddingDimensions})}
+}
+
+func defaultNewAppCore(cfg config.Config) (demoCore, error) {
+	opts := openAIEmbedderOption(cfg)
+	if cfg.DataPath == "" {
+		return memory.New(opts...), nil
+	}
+	return memory.NewPersistent(filepath.Join(cfg.DataPath, "memory.json"), opts...)
 }
 
 func newConfiguredCore(cfg config.Config) (demoCore, error) {

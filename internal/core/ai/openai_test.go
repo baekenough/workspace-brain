@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
@@ -70,8 +72,8 @@ func TestOpenAIConfigFromEnvReturnsEmptyValuesWhenUnset(t *testing.T) {
 	}
 
 	cfg := OpenAIConfigFromEnv()
-	if cfg != (OpenAIConfig{}) {
-		t.Fatalf("config = %+v", cfg)
+	if cfg.BaseURL != "" || cfg.APIKey != "" || cfg.EmbeddingModel != "" || cfg.ResponseModel != "" || cfg.OrganizationID != "" || cfg.ProjectID != "" || cfg.EmbeddingDimensions != 0 || cfg.MaxRetries != 0 || cfg.Sleep != nil || cfg.HTTPClient != nil {
+		t.Fatalf("expected empty config, got %+v", cfg)
 	}
 }
 
@@ -110,6 +112,49 @@ func TestNewOpenAIClientUsesDefaultBaseURLAndProvidedHTTPClient(t *testing.T) {
 	}
 	if client.httpClient != provided {
 		t.Fatal("expected provided HTTP client to be preserved")
+	}
+}
+
+func TestNewOpenAIClientUsesDefaultMaxRetriesAndSleep(t *testing.T) {
+	t.Parallel()
+	client, err := NewOpenAIClient(OpenAIConfig{})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	if client.maxRetries != defaultMaxRetries {
+		t.Fatalf("maxRetries = %d, want %d", client.maxRetries, defaultMaxRetries)
+	}
+	if client.sleep == nil {
+		t.Fatal("expected default sleep to be set")
+	}
+}
+
+func TestNewOpenAIClientUsesProvidedMaxRetriesAndSleep(t *testing.T) {
+	t.Parallel()
+	noopSleep := func(context.Context, time.Duration) error { return nil }
+	client, err := NewOpenAIClient(OpenAIConfig{MaxRetries: 1, Sleep: noopSleep})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	if client.maxRetries != 1 {
+		t.Fatalf("maxRetries = %d, want 1", client.maxRetries)
+	}
+	if client.sleep == nil {
+		t.Fatal("expected provided sleep to be set")
+	}
+}
+
+func TestDefaultSleepCompletesAndRespectsContextCancellation(t *testing.T) {
+	t.Parallel()
+	// Happy path: very short sleep completes.
+	if err := defaultSleep(context.Background(), time.Nanosecond); err != nil {
+		t.Fatalf("defaultSleep: %v", err)
+	}
+	// Cancellation: already-cancelled context returns immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := defaultSleep(ctx, time.Hour); err == nil {
+		t.Fatal("expected cancellation error from defaultSleep")
 	}
 }
 
@@ -186,6 +231,81 @@ func TestOpenAIClientEmbeddingsHTTP(t *testing.T) {
 		t.Fatalf("Embed: %v", err)
 	}
 	if len(vectors) != 1 || len(vectors[0]) != 3 || vectors[0][2] != 3 {
+		t.Fatalf("vectors = %+v", vectors)
+	}
+}
+
+func TestOpenAIClientEmbedEnforcesDimensionMismatch(t *testing.T) {
+	t.Parallel()
+	// Server returns 3-dim vector but client expects 8 dims — error expected.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[1,2,3]}]}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", EmbeddingModel: "embed",
+		HTTPClient: server.Client(), EmbeddingDimensions: 8,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	_, err = client.Embed(context.Background(), []string{"hello"})
+	if err == nil {
+		t.Fatal("expected dimension mismatch error")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "embedding dimension mismatch") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOpenAIClientEmbedTruncatesExcessDimensions(t *testing.T) {
+	t.Parallel()
+	// Server returns 5-dim vector, client configured for 3 dims — MRL truncation.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[1,2,3,4,5]}]}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", EmbeddingModel: "embed",
+		HTTPClient: server.Client(), EmbeddingDimensions: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	vectors, err := client.Embed(context.Background(), []string{"hello"})
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(vectors) != 1 || len(vectors[0]) != 3 {
+		t.Fatalf("vectors = %+v", vectors)
+	}
+	if vectors[0][0] != 1 || vectors[0][1] != 2 || vectors[0][2] != 3 {
+		t.Fatalf("vectors[0] = %v", vectors[0])
+	}
+}
+
+func TestOpenAIClientEmbedExactDimensionsPassThrough(t *testing.T) {
+	t.Parallel()
+	// Server returns exactly the configured dimension count — no truncation needed.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"embedding":[1,2,3]}]}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", EmbeddingModel: "embed",
+		HTTPClient: server.Client(), EmbeddingDimensions: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	vectors, err := client.Embed(context.Background(), []string{"hello"})
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(vectors) != 1 || len(vectors[0]) != 3 {
 		t.Fatalf("vectors = %+v", vectors)
 	}
 }
@@ -476,6 +596,142 @@ func TestOpenAIClientDoJSONSendsHeadersAndDecodesResponse(t *testing.T) {
 		t.Fatalf("out = %+v", out)
 	}
 }
+
+// ── Retry tests ──────────────────────────────────────────────────────────────
+
+func TestOpenAIClientDoJSONRetriesOn429AndSucceeds(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	noopSleep := func(context.Context, time.Duration) error { return nil }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n < 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", HTTPClient: server.Client(),
+		Sleep: noopSleep, MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &out); err != nil {
+		t.Fatalf("doJSON: %v", err)
+	}
+	if !out.OK {
+		t.Fatalf("out.OK = false")
+	}
+	if got := int(attempts.Load()); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestOpenAIClientDoJSONRetriesOn5xxAndSucceeds(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	noopSleep := func(context.Context, time.Duration) error { return nil }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"server error"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", HTTPClient: server.Client(),
+		Sleep: noopSleep, MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	var out struct {
+		OK bool `json:"ok"`
+	}
+	if err := client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &out); err != nil {
+		t.Fatalf("doJSON: %v", err)
+	}
+	if !out.OK {
+		t.Fatalf("out.OK = false")
+	}
+	if got := int(attempts.Load()); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestOpenAIClientDoJSONExhaustsRetries(t *testing.T) {
+	t.Parallel()
+	var attempts atomic.Int32
+	noopSleep := func(context.Context, time.Duration) error { return nil }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"still rate limited"}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", HTTPClient: server.Client(),
+		Sleep: noopSleep, MaxRetries: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	err = client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
+	if err == nil {
+		t.Fatal("expected error after retries exhausted")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("err = %v", err)
+	}
+	// Initial attempt + 2 retries = 3 total.
+	if got := int(attempts.Load()); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+}
+
+func TestOpenAIClientDoJSONSleepCancelledDuringRetry(t *testing.T) {
+	t.Parallel()
+	cancelSleep := func(_ context.Context, _ time.Duration) error {
+		return errors.New("context cancelled")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	client, err := NewOpenAIClient(OpenAIConfig{
+		BaseURL: server.URL, APIKey: "key", HTTPClient: server.Client(),
+		Sleep: cancelSleep, MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("NewOpenAIClient: %v", err)
+	}
+	err = client.doJSON(context.Background(), http.MethodPost, "/anything", map[string]any{}, &struct{}{})
+	if err == nil {
+		t.Fatal("expected error when sleep is cancelled")
+	}
+	if !brainapi.IsKind(err, brainapi.KindInternal) {
+		t.Fatalf("expected KindInternal, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "retry cancelled") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 func newResponseClient(t *testing.T, response string, assert func(*http.Request)) *OpenAIClient {
 	t.Helper()

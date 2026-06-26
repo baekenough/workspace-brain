@@ -118,6 +118,62 @@ func TestFromEnvReturnsEachDurationParseError(t *testing.T) {
 	}
 }
 
+func TestFromEnvParsesOpenAIFields(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "OPENAI_API_KEY":
+			return " sk-test "
+		case "OPENAI_BASE_URL":
+			return " https://api.example.com/v1 "
+		case "OPENAI_EMBEDDING_MODEL":
+			return " text-embedding-3-small "
+		case "OPENAI_ORG_ID":
+			return " org-123 "
+		case "OPENAI_PROJECT_ID":
+			return " proj-456 "
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.OpenAIAPIKey != "sk-test" {
+		t.Fatalf("OpenAIAPIKey = %q", cfg.OpenAIAPIKey)
+	}
+	if cfg.OpenAIBaseURL != "https://api.example.com/v1" {
+		t.Fatalf("OpenAIBaseURL = %q", cfg.OpenAIBaseURL)
+	}
+	if cfg.OpenAIEmbeddingModel != "text-embedding-3-small" {
+		t.Fatalf("OpenAIEmbeddingModel = %q", cfg.OpenAIEmbeddingModel)
+	}
+	if cfg.OpenAIOrganizationID != "org-123" {
+		t.Fatalf("OpenAIOrganizationID = %q", cfg.OpenAIOrganizationID)
+	}
+	if cfg.OpenAIProjectID != "proj-456" {
+		t.Fatalf("OpenAIProjectID = %q", cfg.OpenAIProjectID)
+	}
+}
+
+func TestFromEnvOpenAIFieldsDefaultToEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		if key == "API_TOKEN" {
+			return "token"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.OpenAIAPIKey != "" || cfg.OpenAIBaseURL != "" || cfg.OpenAIEmbeddingModel != "" || cfg.OpenAIOrganizationID != "" || cfg.OpenAIProjectID != "" {
+		t.Fatalf("expected empty OpenAI fields, got %+v", cfg)
+	}
+}
+
 func TestValidateRequiresNonEmptyFields(t *testing.T) {
 	t.Parallel()
 	base := Config{APIToken: "token", Addr: ":8080", CommandName: "brain", SlackAppName: "workspace-brain", ReadHeaderTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, ShutdownTimeout: time.Second}
