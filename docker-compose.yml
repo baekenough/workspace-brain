@@ -1,0 +1,103 @@
+# Local dependency stack for workspace-brain development.
+#
+# Default command starts only the dependency services (postgres, qdrant, rabbitmq):
+#   docker compose up -d
+#
+# To also build and run the application:
+#   docker compose --profile app up -d
+#
+# See docs/local-development.md for the full local development guide.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: brain
+      POSTGRES_USER: brain
+      POSTGRES_PASSWORD: brain_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brain -d brain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: brain
+      RABBITMQ_DEFAULT_PASS: brain_local
+      RABBITMQ_DEFAULT_VHOST: brain
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI (http://localhost:15672)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Optional application service — started only when --profile app is passed.
+  # Builds the workspace-brain binary image from the local Dockerfile.
+  app:
+    build:
+      context: .
+    profiles:
+      - app
+    environment:
+      ADDR: ":8080"
+      API_TOKEN: ${API_TOKEN:-dev-token}
+      DATA_PATH: /data
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgres://brain:brain_local@postgres:5432/brain?sslmode=disable}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://brain:brain_local@rabbitmq:5672/brain}
+      # Optional: Slack adapter
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+      ADMIN_USERS: ${ADMIN_USERS:-}
+      # Optional: OpenAI-compatible provider
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
+      OPENAI_RESPONSE_MODEL: ${OPENAI_RESPONSE_MODEL:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - app_data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  rabbitmq_data:
+  app_data:

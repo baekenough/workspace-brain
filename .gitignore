@@ -11,8 +11,7 @@
 bin/
 dist/
 *.test
-coverage.out
-coverage-filtered.out
+*.out
 
 # Local agent/runtime state, not product source
 AGENTS.md

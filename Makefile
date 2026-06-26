@@ -1,4 +1,4 @@
-.PHONY: build vet test race coverage-out coverage demo docker-build help
+.PHONY: build vet test race coverage-out coverage demo docker-build dev-up dev-down dev-logs help
 
 IMAGE ?= workspace-brain:local
 COVERAGE_PROFILE ?= coverage.out
@@ -34,6 +34,18 @@ demo:
 ## Build the local Docker image. Override IMAGE=name:tag.
 docker-build:
 	docker build -t $(IMAGE) .
+
+## Start the local dependency stack (postgres, qdrant, rabbitmq) in background.
+dev-up:
+	docker compose up -d
+
+## Stop and remove local dependency containers and networks.
+dev-down:
+	docker compose down
+
+## Tail logs from all running local dependency containers.
+dev-logs:
+	docker compose logs -f
 
 ## Show available Make targets.
 help:
