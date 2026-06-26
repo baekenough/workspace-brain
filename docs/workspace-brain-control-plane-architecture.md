@@ -123,7 +123,7 @@ sequenceDiagram
     A-->>U: rendered response
 ```
 
-`create`는 admin 권한이 필요하다. 현재 gateway는 순차 `tenant-000001` 형식의 ID를 만든다.
+`create`는 admin 권한이 필요하다. gateway는 `crypto/rand`를 이용해 `tenant-<32-hex-chars>` 형식의 무작위 ID를 생성한다.
 
 ### 4.2 Ingest
 

@@ -28,7 +28,7 @@ docker build -t workspace-brain:local .
 Expected demo output shape:
 
 ```text
-tenant=tenant-000001 job=job-000001 answer=...
+tenant=tenant-3c4997260a941958762c934928ad17ba job=job-616eec1b005fb0258433d73b843f8380 answer=...
 ```
 
 You can also use Make targets for the same gates:
@@ -99,7 +99,7 @@ curl -sS http://localhost:8080/api/commands \
 curl -sS http://localhost:8080/api/commands \
   -H 'Authorization: Bearer dev-token' \
   -H 'Content-Type: application/json' \
-  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1","roles":["member"]},"text":"status job-000001"}'
+  -d '{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1","roles":["member"]},"text":"status job-616eec1b005fb0258433d73b843f8380"}'
 curl -sS http://localhost:8080/api/commands \
   -H 'Authorization: Bearer dev-token' \
   -H 'Content-Type: application/json' \
