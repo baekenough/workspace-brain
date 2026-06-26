@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
@@ -535,6 +536,100 @@ func TestDefaultGeneratorsProduceCollisionResistantIDs(t *testing.T) {
 			t.Fatalf("duplicate job ID at iteration %d: %q", i, result.JobID)
 		}
 		seenJobs[result.JobID] = true
+	}
+}
+
+// ── Async ingest-worker tests ─────────────────────────────────────────────────
+
+// fakeCoreCompleter satisfies ingest.CoreCompleter without doing real work.
+type fakeCoreCompleter struct{}
+
+func (f *fakeCoreCompleter) CompleteJob(brainapi.TenantID, brainapi.JobID, brainapi.JobStatus, string, string) error {
+	return nil
+}
+
+// TestGatewayIngestWithQueueReachesCompleted verifies that after a server-mode
+// ingest (queue configured), the job transitions to completed once the worker
+// has processed the completion task.
+func TestGatewayIngestWithQueueReachesCompleted(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	store := jobs.NewStore()
+
+	gw, err := New(core, RoleAuthorizer{}, store, WithJobIDGenerator(staticJobID("job-async")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Wire the worker: gateway is the GatewayCompleter, fakeCoreCompleter handles
+	// the core side (fakeCore does not have CompleteJob).
+	worker := ingest.NewWorker(&fakeCoreCompleter{}, gw, 64)
+	worker.Start()
+	defer worker.Stop()
+	gw.SetQueue(worker)
+
+	result, err := gw.Ingest(context.Background(), IngestCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{ID: "U1", Roles: []string{"member"}},
+		Source:     brainapi.SourceRef{URI: "file://a.pdf", Name: "a.pdf"},
+	})
+	if err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if result.JobID != "job-async" {
+		t.Fatalf("jobID = %q", result.JobID)
+	}
+
+	// Block until the worker has processed the completion task.
+	worker.WaitForIdle()
+
+	snapshot, err := store.Snapshot("tenant-1", "job-async")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot.Status != brainapi.JobCompleted {
+		t.Fatalf("status = %q, want completed", snapshot.Status)
+	}
+}
+
+// alwaysFullQueue is a Queue implementation that always rejects Enqueue calls.
+type alwaysFullQueue struct{}
+
+func (alwaysFullQueue) Enqueue(context.Context, ingest.Task) error {
+	return brainapi.E(brainapi.KindInternal, "test_queue", "queue full", nil)
+}
+
+// TestGatewayIngestWithFullQueueMarksJobFailed verifies that a failed enqueue
+// (e.g. queue full or stopped) transitions the job to the failed state and
+// returns an error to the caller.
+func TestGatewayIngestWithFullQueueMarksJobFailed(t *testing.T) {
+	t.Parallel()
+	core := newFakeCore()
+	store := jobs.NewStore()
+
+	gw, err := New(core, RoleAuthorizer{}, store,
+		WithJobIDGenerator(staticJobID("job-queue-fail")),
+		WithQueue(alwaysFullQueue{}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = gw.Ingest(context.Background(), IngestCommand{
+		BindingKey: "slack:channel:C1",
+		Principal:  brainapi.Principal{ID: "U1", Roles: []string{"member"}},
+		Source:     brainapi.SourceRef{URI: "file://a.pdf"},
+	})
+	if err == nil {
+		t.Fatal("expected Ingest to return error when queue is full")
+	}
+
+	snapshot, snapErr := store.Snapshot("tenant-1", "job-queue-fail")
+	if snapErr != nil {
+		t.Fatalf("Snapshot: %v", snapErr)
+	}
+	if snapshot.Status != brainapi.JobFailed {
+		t.Fatalf("status = %q, want failed", snapshot.Status)
 	}
 }
 

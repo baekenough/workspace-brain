@@ -13,6 +13,7 @@ import (
 
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
 	"github.com/sangyi/workspace-brain/internal/control/httpapi"
+	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/ops"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
@@ -66,10 +67,21 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 	if err != nil {
 		return err
 	}
-	gw, err := newAppGateway(core, gateway.RoleAuthorizer{}, jobs.NewStore())
+	jobStore := jobs.NewStore()
+	gw, err := newAppGateway(core, gateway.RoleAuthorizer{}, jobStore)
 	if err != nil {
 		return err
 	}
+
+	// Wire the async ingest-completion worker when using the real gateway
+	// implementation.  The type assertion succeeds for defaultNewAppGateway;
+	// tests that override newAppGateway with a stub are unaffected.
+	concreteGW := gw.(*gateway.Gateway)
+	worker := ingest.NewWorker(core, concreteGW, 64)
+	worker.Start()
+	defer worker.Stop()
+	concreteGW.SetQueue(worker)
+
 	handler, err := buildHandler(cfg, gw)
 	if err != nil {
 		return err

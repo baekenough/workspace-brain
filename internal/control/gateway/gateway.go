@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 
+	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
@@ -42,6 +43,7 @@ type Gateway struct {
 	tenantIDs  TenantIDGenerator
 	jobIDs     JobIDGenerator
 	loader     sources.SourceLoader
+	queue      ingest.Queue // optional async completion worker; nil = sync path
 }
 
 // Option configures a Gateway.
@@ -72,6 +74,25 @@ func WithSourceLoader(loader sources.SourceLoader) Option {
 			g.loader = loader
 		}
 	}
+}
+
+// WithQueue wires an async ingest-completion worker to the gateway.
+// When set, Ingest hands a completion task to the queue after synchronously
+// indexing the content; the worker then drives the job to a terminal state.
+// When nil (the default), Ingest stays on the existing synchronous path.
+func WithQueue(q ingest.Queue) Option {
+	return func(g *Gateway) {
+		if q != nil {
+			g.queue = q
+		}
+	}
+}
+
+// SetQueue sets (or replaces) the async ingest-completion queue after
+// construction.  It is provided for lifecycle wiring in the server entrypoint
+// where the gateway and the worker share a mutual reference.
+func (g *Gateway) SetQueue(q ingest.Queue) {
+	g.queue = q
 }
 
 // New creates a Gateway.
@@ -185,7 +206,13 @@ type IngestResult struct {
 	JobID    brainapi.JobID
 }
 
-// Ingest creates the control-plane job before enqueueing core work.
+// Ingest creates the control-plane job, indexes the content synchronously,
+// and — when an async queue is configured — enqueues a lightweight completion
+// task so the job transitions from running to completed in the background.
+//
+// When no queue is configured (the default), the method returns with the job
+// in "running" state, preserving the original behaviour for tests and the demo
+// flow.
 func (g *Gateway) Ingest(ctx context.Context, cmd IngestCommand) (IngestResult, error) {
 	const op = "gateway_ingest"
 	tenantID, err := g.resolveAndAuthorize(ctx, cmd.BindingKey, cmd.Principal, brainapi.ActionIngest, op)
@@ -212,11 +239,21 @@ func (g *Gateway) Ingest(ctx context.Context, cmd IngestCommand) (IngestResult, 
 			metadata = cloneMap(loaded.Metadata)
 		}
 	}
+	// Index content synchronously so the data is immediately queryable.
 	if err := g.core.Ingest(ctx, brainapi.IngestRequest{TenantID: tenantID, JobID: jobID, Source: source, Metadata: metadata}); err != nil {
 		_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
 		return IngestResult{}, err
 	}
 	_, _ = g.jobs.MarkRunning(tenantID, jobID)
+
+	if g.queue != nil {
+		// Async path: hand off job-state finalization to the completion worker.
+		// The job stays "running" until the worker calls HandleJobCompleted.
+		if err := g.queue.Enqueue(ctx, ingest.Task{TenantID: tenantID, JobID: jobID}); err != nil {
+			_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
+			return IngestResult{}, err
+		}
+	}
 	return IngestResult{TenantID: tenantID, JobID: jobID}, nil
 }
 
