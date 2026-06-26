@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
+	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
+	"github.com/sangyi/workspace-brain/internal/control/ops"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
 	"github.com/sangyi/workspace-brain/internal/core/ai"
 	"github.com/sangyi/workspace-brain/internal/core/memory"
@@ -848,5 +850,268 @@ func TestRunDemoReturnsCoreError(t *testing.T) {
 	}
 	if err := runDemo(context.Background(), &bytes.Buffer{}); err == nil || err.Error() != "core boom" {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// ── RabbitMQ queue-selection wiring tests ────────────────────────────────────
+
+// stubQueueRunner is a test double that satisfies queueRunner without needing
+// a real RabbitMQ broker.
+type stubQueueRunner struct {
+	startErr  error
+	startedCh chan struct{}
+	stoppedCh chan struct{}
+}
+
+func newStubQueueRunner(startErr error) *stubQueueRunner {
+	return &stubQueueRunner{
+		startErr:  startErr,
+		startedCh: make(chan struct{}),
+		stoppedCh: make(chan struct{}),
+	}
+}
+
+func (s *stubQueueRunner) Start(_ context.Context) error {
+	if s.startErr != nil {
+		return s.startErr
+	}
+	close(s.startedCh)
+	return nil
+}
+func (s *stubQueueRunner) Stop()                                          { close(s.stoppedCh) }
+func (s *stubQueueRunner) Enqueue(_ context.Context, _ ingest.Task) error { return nil }
+
+// TestRunServerUsesRabbitMQQueueWhenURLSet verifies that when RABBITMQ_URL is
+// configured the RabbitMQ queue is started and stopped as part of the server
+// lifecycle.
+func TestRunServerUsesRabbitMQQueueWhenURLSet(t *testing.T) {
+	oldNewRMQ := newRabbitMQQueue
+	defer func() { newRabbitMQQueue = oldNewRMQ }()
+
+	stub := newStubQueueRunner(nil)
+	newRabbitMQQueue = func(_ string, _ ingest.CoreCompleter, _ ingest.GatewayCompleter) queueRunner {
+		return stub
+	}
+
+	called := false
+	err := runServer(context.Background(), func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "RABBITMQ_URL":
+			return "amqp://localhost:5672/"
+		default:
+			return ""
+		}
+	}, func(_ context.Context, _ *http.Server, _ config.Config) error {
+		called = true
+		return errors.New("stop")
+	})
+	if err == nil || err.Error() != "stop" || !called {
+		t.Fatalf("err=%v called=%v", err, called)
+	}
+	// Verify Start was called (channel closed).
+	select {
+	case <-stub.startedCh:
+	default:
+		t.Fatal("expected queue Start() to be called")
+	}
+	// Verify Stop was called (defer fires after serve returns).
+	select {
+	case <-stub.stoppedCh:
+	default:
+		t.Fatal("expected queue Stop() to be called")
+	}
+}
+
+// TestRunServerRabbitMQStartErrorPropagates verifies that a Start() failure
+// causes runServer to return the error without calling the serve function.
+func TestRunServerRabbitMQStartErrorPropagates(t *testing.T) {
+	oldNewRMQ := newRabbitMQQueue
+	defer func() { newRabbitMQQueue = oldNewRMQ }()
+
+	newRabbitMQQueue = func(_ string, _ ingest.CoreCompleter, _ ingest.GatewayCompleter) queueRunner {
+		return newStubQueueRunner(errors.New("connection refused"))
+	}
+
+	err := runServer(context.Background(), func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "RABBITMQ_URL":
+			return "amqp://localhost:5672/"
+		default:
+			return ""
+		}
+	}, func(context.Context, *http.Server, config.Config) error {
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("err=%v, want 'connection refused'", err)
+	}
+}
+
+// ── Healthcheck subcommand tests ──────────────────────────────────────────────
+
+// failTransport is an http.RoundTripper that always returns an error.
+type failTransport struct{ err error }
+
+func (f failTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// TestRunHealthcheckReturns0On2xx verifies that a 2xx response yields exit code 0.
+func TestRunHealthcheckReturns0On2xx(t *testing.T) {
+	t.Parallel()
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer svr.Close()
+	if code := runHealthcheck(svr.Listener.Addr().String(), svr.Client()); code != 0 {
+		t.Fatalf("code=%d, want 0", code)
+	}
+}
+
+// TestRunHealthcheckReturns1OnNon2xx verifies that a non-2xx response yields
+// exit code 1.
+func TestRunHealthcheckReturns1OnNon2xx(t *testing.T) {
+	t.Parallel()
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer svr.Close()
+	if code := runHealthcheck(svr.Listener.Addr().String(), svr.Client()); code != 1 {
+		t.Fatalf("code=%d, want 1", code)
+	}
+}
+
+// TestRunHealthcheckReturns1OnClientError verifies that a transport error
+// yields exit code 1.
+func TestRunHealthcheckReturns1OnClientError(t *testing.T) {
+	t.Parallel()
+	client := &http.Client{Transport: failTransport{err: errors.New("connect refused")}}
+	if code := runHealthcheck("127.0.0.1:9999", client); code != 1 {
+		t.Fatalf("code=%d, want 1", code)
+	}
+}
+
+// TestRunHealthcheckReturns1OnInvalidAddr verifies that an unparseable addr
+// yields exit code 1 without making any network call.
+func TestRunHealthcheckReturns1OnInvalidAddr(t *testing.T) {
+	t.Parallel()
+	// "no-port" has no port separator — net.SplitHostPort returns an error.
+	if code := runHealthcheck("no-port", nil); code != 1 {
+		t.Fatalf("code=%d, want 1", code)
+	}
+}
+
+// TestRunHealthcheckBindAllHostReplacedWithLoopback verifies that an empty
+// host (e.g., ":8080" bind-all) is replaced with 127.0.0.1 so the probe
+// reaches the local server.
+func TestRunHealthcheckBindAllHostReplacedWithLoopback(t *testing.T) {
+	t.Parallel()
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == ops.ReadinessPath {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer svr.Close()
+	// Build a bind-all address (empty host) using the server's port.
+	_, portStr, err := net.SplitHostPort(svr.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort: %v", err)
+	}
+	addr := ":" + portStr // host="" triggers the 127.0.0.1 substitution
+	if code := runHealthcheck(addr, svr.Client()); code != 0 {
+		t.Fatalf("code=%d, want 0 (bind-all host not replaced with 127.0.0.1)", code)
+	}
+}
+
+// TestRunHealthcheckDefaultAddrWhenEnvEmpty verifies that when ADDR is unset
+// runHealthcheck is called with the default ":8080" address.  Because no real
+// server is listening, the injected client returns a transport error and the
+// captured exit code is 1.
+func TestRunHealthcheckDefaultAddrWhenEnvEmpty(t *testing.T) {
+	// Modifies package-level vars — must not run in parallel.
+	oldOsExit := osExit
+	defer func() { osExit = oldOsExit }()
+	oldHTTPClient := httpClient
+	defer func() { httpClient = oldHTTPClient }()
+
+	var capturedCode int
+	osExit = func(code int) { capturedCode = code }
+	httpClient = &http.Client{Transport: failTransport{err: errors.New("no server")}}
+
+	err := run(context.Background(), []string{"wb", "healthcheck"}, func(string) string {
+		return "" // ADDR is empty → default ":8080" should be used
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if capturedCode != 1 {
+		t.Fatalf("exit code=%d, want 1 (no server listening at default addr)", capturedCode)
+	}
+}
+
+// TestDefaultNewRabbitMQQueueIsCalledWhenNotOverridden exercises the real
+// defaultNewRabbitMQQueue shim.  An invalid AMQP scheme causes amqp.Dial to
+// fail immediately (no network I/O), so the test is deterministic.
+func TestDefaultNewRabbitMQQueueIsCalledWhenNotOverridden(t *testing.T) {
+	// Do NOT override newRabbitMQQueue so that defaultNewRabbitMQQueue is used.
+	// Requires a non-parallel test to avoid races with tests that DO override it.
+	err := runServer(context.Background(), func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "RABBITMQ_URL":
+			// "invalid" scheme → amqp.Dial rejects it immediately without dialing.
+			return "invalid://localhost"
+		default:
+			return ""
+		}
+	}, func(context.Context, *http.Server, config.Config) error { return nil })
+	if err == nil {
+		t.Fatalf("expected error from invalid RabbitMQ scheme, got nil")
+	}
+}
+
+// TestRunRoutesHealthcheckSubcommand verifies that run() dispatches to
+// runHealthcheck when the "healthcheck" subcommand is passed, captures the
+// exit code via the osExit seam, and returns nil (the real os.Exit would have
+// stopped execution).
+func TestRunRoutesHealthcheckSubcommand(t *testing.T) {
+	// Modifies package-level vars — must not run in parallel with other tests
+	// that do the same.
+	oldOsExit := osExit
+	defer func() { osExit = oldOsExit }()
+	oldHTTPClient := httpClient
+	defer func() { httpClient = oldHTTPClient }()
+
+	var capturedCode int
+	osExit = func(code int) { capturedCode = code }
+
+	svr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == ops.ReadinessPath {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.NotFound(w, r)
+		}
+	}))
+	defer svr.Close()
+
+	httpClient = svr.Client()
+	addr := svr.Listener.Addr().String()
+
+	err := run(context.Background(), []string{"wb", "healthcheck"}, func(key string) string {
+		if key == "ADDR" {
+			return addr
+		}
+		return ""
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if capturedCode != 0 {
+		t.Fatalf("exit code=%d, want 0", capturedCode)
 	}
 }

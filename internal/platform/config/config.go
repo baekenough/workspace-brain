@@ -42,6 +42,10 @@ type Config struct {
 	OpenAIEmbeddingModel string
 	OpenAIOrganizationID string
 	OpenAIProjectID      string
+	// RabbitMQURL is optional. When non-empty the server uses a RabbitMQ-backed
+	// ingest completion queue; when empty the in-process worker is used instead.
+	// Example: amqp://guest:guest@localhost:5672/
+	RabbitMQURL string
 }
 
 const (
@@ -75,6 +79,7 @@ func FromEnv(getenv LookupFunc) (Config, error) {
 		OpenAIEmbeddingModel: strings.TrimSpace(getenv("OPENAI_EMBEDDING_MODEL")),
 		OpenAIOrganizationID: strings.TrimSpace(getenv("OPENAI_ORG_ID")),
 		OpenAIProjectID:      strings.TrimSpace(getenv("OPENAI_PROJECT_ID")),
+		RabbitMQURL:          strings.TrimSpace(getenv("RABBITMQ_URL")),
 	}
 	var err error
 	if cfg.ReadinessRequired, err = parseBool(getenv, "READINESS_REQUIRED", false); err != nil {

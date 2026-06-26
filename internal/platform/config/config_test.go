@@ -217,6 +217,42 @@ func TestFromEnvCreateAllowUsersDefaultsToEmpty(t *testing.T) {
 	}
 }
 
+func TestFromEnvParsesRabbitMQURL(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		switch key {
+		case "API_TOKEN":
+			return "token"
+		case "RABBITMQ_URL":
+			return " amqp://guest:guest@localhost:5672/ "
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.RabbitMQURL != "amqp://guest:guest@localhost:5672/" {
+		t.Fatalf("RabbitMQURL = %q", cfg.RabbitMQURL)
+	}
+}
+
+func TestFromEnvRabbitMQURLDefaultsToEmpty(t *testing.T) {
+	t.Parallel()
+	cfg, err := FromEnv(func(key string) string {
+		if key == "API_TOKEN" {
+			return "token"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	if cfg.RabbitMQURL != "" {
+		t.Fatalf("RabbitMQURL = %q, want empty", cfg.RabbitMQURL)
+	}
+}
+
 func TestValidateRequiresNonEmptyFields(t *testing.T) {
 	t.Parallel()
 	base := Config{APIToken: "token", Addr: ":8080", CommandName: "brain", SlackAppName: "workspace-brain", ReadHeaderTimeout: time.Second, ReadTimeout: time.Second, WriteTimeout: time.Second, IdleTimeout: time.Second, ShutdownTimeout: time.Second}

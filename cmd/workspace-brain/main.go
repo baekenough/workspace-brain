@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,7 @@ import (
 	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
 	"github.com/sangyi/workspace-brain/internal/control/ops"
+	"github.com/sangyi/workspace-brain/internal/control/rabbitmq"
 	slackadapter "github.com/sangyi/workspace-brain/internal/control/slack"
 	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/internal/core/ai"
@@ -40,11 +42,32 @@ type demoCore interface {
 	CompleteJob(tenantID brainapi.TenantID, jobID brainapi.JobID, status brainapi.JobStatus, resultRef, message string) error
 }
 
+// queueRunner is satisfied by *rabbitmq.Queue in production and by test doubles
+// in unit tests. It extends ingest.Queue with lifecycle management.
+type queueRunner interface {
+	ingest.Queue
+	Start(ctx context.Context) error
+	Stop()
+}
+
+// httpGetter is a narrow interface for the healthcheck HTTP client, allowing
+// unit tests to inject a stub without making real network connections.
+type httpGetter interface {
+	Get(url string) (*http.Response, error)
+}
+
 var (
-	fatal         = log.Fatal
-	newAppCore    = defaultNewAppCore
-	newAppGateway = defaultNewAppGateway
+	fatal                       = log.Fatal
+	newAppCore                  = defaultNewAppCore
+	newAppGateway               = defaultNewAppGateway
+	newRabbitMQQueue            = defaultNewRabbitMQQueue
+	osExit           func(int)  = os.Exit
+	httpClient       httpGetter = http.DefaultClient
 )
+
+func defaultNewRabbitMQQueue(url string, core ingest.CoreCompleter, gw ingest.GatewayCompleter) queueRunner {
+	return rabbitmq.NewQueue(url, core, gw)
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -55,10 +78,44 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, getenv envFunc, serve serveFunc, out io.Writer) error {
-	if len(args) > 1 && args[1] == "demo" {
-		return runDemo(ctx, out)
+	if len(args) > 1 {
+		switch args[1] {
+		case "demo":
+			return runDemo(ctx, out)
+		case "healthcheck":
+			addr := strings.TrimSpace(getenv("ADDR"))
+			if addr == "" {
+				addr = ":8080"
+			}
+			code := runHealthcheck(addr, httpClient)
+			osExit(code)
+			return nil
+		}
 	}
 	return runServer(ctx, getenv, serve)
+}
+
+// runHealthcheck probes the local readiness endpoint derived from addr and
+// returns 0 on a 2xx response or 1 otherwise.  It is intended as the
+// HEALTHCHECK binary for the distroless container image.
+func runHealthcheck(addr string, client httpGetter) int {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 1
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	url := "http://" + net.JoinHostPort(host, port) + ops.ReadinessPath
+	resp, err := client.Get(url)
+	if err != nil {
+		return 1
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return 0
+	}
+	return 1
 }
 
 func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
@@ -80,14 +137,23 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 		return err
 	}
 
-	// Wire the async ingest-completion worker when using the real gateway
-	// implementation.  The type assertion succeeds for defaultNewAppGateway;
-	// tests that override newAppGateway with a stub are unaffected.
+	// Wire the async ingest-completion queue.  When RABBITMQ_URL is set the
+	// real RabbitMQ-backed queue is used; otherwise the lightweight in-process
+	// worker is used (unchanged default behaviour).
 	concreteGW := gw.(*gateway.Gateway)
-	worker := ingest.NewWorker(core, concreteGW, 64)
-	worker.Start()
-	defer worker.Stop()
-	concreteGW.SetQueue(worker)
+	if cfg.RabbitMQURL != "" {
+		rmq := newRabbitMQQueue(cfg.RabbitMQURL, core, concreteGW)
+		if err := rmq.Start(ctx); err != nil {
+			return fmt.Errorf("rabbitmq: %w", err)
+		}
+		defer rmq.Stop()
+		concreteGW.SetQueue(rmq)
+	} else {
+		worker := ingest.NewWorker(core, concreteGW, 64)
+		worker.Start()
+		defer worker.Stop()
+		concreteGW.SetQueue(worker)
+	}
 
 	handler, err := buildHandler(cfg, gw)
 	if err != nil {
@@ -298,18 +364,18 @@ func runDemoFlow(ctx context.Context, out io.Writer, core demoCore, gw appGatewa
 	if err != nil {
 		return err
 	}
-	ingest, err := gw.Ingest(ctx, gateway.IngestCommand{BindingKey: "demo:project:default", Principal: member, Source: brainapi.SourceRef{URI: "file://demo.md", Name: "demo.md", MimeType: "text/markdown"}, Metadata: map[string]string{"content": "workspace-brain은 테넌트별 지식을 수집하고 근거 기반 응답을 제공하는 로컬 RAG 시스템입니다."}})
+	ingestResult, err := gw.Ingest(ctx, gateway.IngestCommand{BindingKey: "demo:project:default", Principal: member, Source: brainapi.SourceRef{URI: "file://demo.md", Name: "demo.md", MimeType: "text/markdown"}, Metadata: map[string]string{"content": "workspace-brain은 테넌트별 지식을 수집하고 근거 기반 응답을 제공하는 로컬 RAG 시스템입니다."}})
 	if err != nil {
 		return err
 	}
-	if err := core.CompleteJob(created.TenantID, ingest.JobID, brainapi.JobCompleted, "memory://demo", ""); err != nil {
+	if err := core.CompleteJob(created.TenantID, ingestResult.JobID, brainapi.JobCompleted, "memory://demo", ""); err != nil {
 		return err
 	}
 	answer, err := gw.Ask(ctx, gateway.AskCommand{BindingKey: "demo:project:default", Principal: member, Question: "workspace-brain은 무엇인가?"})
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(out, "tenant=%s job=%s answer=%s\n", created.TenantID, ingest.JobID, answer.Answer)
+	_, err = fmt.Fprintf(out, "tenant=%s job=%s answer=%s\n", created.TenantID, ingestResult.JobID, answer.Answer)
 	return err
 }
 

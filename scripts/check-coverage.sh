@@ -17,8 +17,13 @@ go test ./... -coverprofile="$profile"
 # and run against a real Qdrant container via `go test -tags=integration` (REST
 # adapter). Real coverage is 98.8% under that tag; it has zero default-build tests
 # by design. Exclude it here for the same reason as postgres.
+#
+# rabbitmq is an integration-only package (WB-06b): all its tests carry
+# //go:build integration and run against a real RabbitMQ container via
+# `go test -tags=integration`. It has zero default-build tests by design.
+# Exclude it here for the same reason as postgres and qdrant.
 filtered="${profile%.out}-filtered.out"
-grep -vE '^github\.com/sangyi/workspace-brain/internal/core/(coretest|postgres|qdrant)/' "$profile" \
+grep -vE '^github\.com/sangyi/workspace-brain/(internal/core/(coretest|postgres|qdrant)|internal/control/rabbitmq)/' "$profile" \
   > "$filtered"
 
 total="$(go tool cover -func="$filtered" | awk '/^total:/ {print $3}')"
