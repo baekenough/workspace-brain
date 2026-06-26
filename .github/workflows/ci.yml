@@ -14,10 +14,24 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: go test ./...
-      - run: go test -race ./...
-      - run: ./scripts/check-coverage.sh coverage.out
-      - name: govulncheck
+      - name: gofmt check
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Unformatted files (run gofmt -w on them):"
+            echo "$unformatted"
+            exit 1
+          fi
+      - run: make vet
+      - run: make test
+      - run: make race
+      - run: make coverage-out
+      - run: ./scripts/check-coverage.sh coverage.out
+      - name: docker build
+        run: make docker-build
+      - name: govulncheck
+        # Pin to a specific release for reproducible CI; bump this tag
+        # deliberately when upgrading (do not revert to @latest).
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...

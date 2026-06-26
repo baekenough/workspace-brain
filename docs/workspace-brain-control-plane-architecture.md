@@ -1,197 +1,308 @@
 # workspace-brain Control Plane Architecture (제어 표면)
 
-workspace-brain의 **제어 표면** 아키텍처. 사용자의 명령을 받아 데이터 코어의 계약(**workspace-brain Data Architecture** 5절)을 호출하는 어댑터 계층이다. 데이터 코어와 분리되어, Slack 외에 웹·API·CLI 같은 표면을 코어 변경 없이 붙일 수 있다.
+workspace-brain의 제어 표면은 사용자 명령을 표면 무관 요청으로 바꾸고 `brainapi.Core` 계약을 호출한다. Slack은 현재 구현된 frontend adapter 중 하나다. 핵심 구조는 **surface-neutral command gateway + local memory core + adapter boundary**다.
 
-핵심 원칙 — **코어는 호출자가 누구인지 모른다.** 표면 고유성(Slack 채널·response_url·block kit)은 표면 어댑터에 가두고, 공통 게이트웨이가 표면 무관 요청만 코어 계약으로 전달한다.
+원칙: **코어는 호출 표면을 모른다.** Slack 채널, HTTP bearer token, 향후 Web/CLI 세션 같은 표면 정보는 adapter 안에서 `Principal`, `BindingKey`, `Text`로 정규화된다.
 
 ---
 
-## 1. 3계층 구조
+## 1. 계층 모델
 
 ```mermaid
 flowchart TB
-    U["사용자"]
+    U[사용자 / 클라이언트]
 
-    subgraph SURF["표면 어댑터"]
-        direction LR
-        SLACK["Slack 어댑터"]
-        WEB["웹 어댑터 (향후)"]
-        API["API/CLI (향후)"]
+    subgraph ADAPTERS[Frontend adapters]
+        SLACK[Slack]
+        HTTP[JSON HTTP]
+        FUTURE[향후 Web / CLI / Admin]
     end
 
-    subgraph GW["공통 게이트웨이"]
-        direction LR
-        AUTH["권한 판정"]
-        BIND["바인딩→tenant 해석"]
-        CALL["계약 호출 (혼합)"]
-        NORM["응답 정규화"]
-        JOBS["작업 상태"]
-    end
+    DISPATCH[Frontend Dispatcher]
+    GW[Control Gateway]
+    JOBS[Control Job Ledger]
+    LOADER[Source Loader]
+    CORE[Local Memory Core]
 
-    CORE["데이터 코어 (계약)"]
-
-    U --> SURF --> GW --> CORE
-    CORE -.완료 콜백.-> GW
+    U --> SLACK
+    U --> HTTP
+    U --> FUTURE
+    SLACK --> DISPATCH
+    HTTP --> DISPATCH
+    FUTURE --> DISPATCH
+    DISPATCH --> GW
+    GW --> JOBS
+    GW --> LOADER
+    GW --> CORE
 ```
 
-| 계층 | 책임 |
-|------|------|
-| **표면 어댑터** | 표면 고유 입력 수신, 신원 증명 생성, 표면 무관 키로 표준화, 표면 고유 응답 렌더링 |
-| **공통 게이트웨이** | 권한 판정, 바인딩→tenant 해석, 코어 계약 호출(혼합), 응답 정규화, 작업 상태 관리 |
-| **데이터 코어** | 표면 무관 계약 제공(별도 문서) |
+| 계층 | 구현 패키지 | 책임 |
+|------|-------------|------|
+| Frontend adapter | `internal/control/slack`, `internal/control/httpapi` | 표면 인증, 신원·위치 정규화, dispatcher 호출, 표면 응답 렌더링 |
+| Frontend dispatcher | `internal/control/frontend` | 공통 텍스트 커맨드 파싱과 gateway 호출 |
+| Control gateway | `internal/control/gateway` | 바인딩 해석, 권한 판정, ID 생성, source loading, core 호출, safe error 정규화 |
+| Job ledger | `internal/control/jobs` | `(tenant_id, job_id)` 기준 control-plane 작업 상태 저장과 core 상태 reconcile |
+| Source loader | `internal/control/sources` | ingest source를 bounded content metadata로 변환 |
+| Data core | `internal/core/memory`, `pkg/brainapi` | tenant-scoped local RAG, discovery, job status, project state, optional JSON snapshot |
+| Platform | `internal/platform/config`, `internal/platform/server`, `internal/control/ops` | 환경 설정, HTTP server, health/readiness |
 
 ---
 
-## 2. 다중 표면 설계
+## 2. Package map
 
-처음부터 표면 무관 계약으로 설계하고, 지금은 Slack 어댑터만 구현한다. 표면이 늘어도 게이트웨이·코어는 불변이고, 새 어댑터만 추가한다.
-
-- 표면마다 식별자가 다르다 — Slack은 채널 ID, 웹은 세션/선택, API는 명시적 키.
-- 어댑터가 자기 식별자를 **표면 무관 바인딩 키**로 표준화(예: `slack:channel:C123`).
-- "채널"이라는 Slack 개념은 어댑터에 갇히고, 게이트웨이는 "바인딩 키 → tenant"라는 일반 규칙만 안다.
-
----
-
-## 3. 공통 게이트웨이
-
-모든 표면이 반드시 통과하는 단일 관문.
-
-- **바인딩 해석(계약 예외)** — 일반 코어 계약은 이미 해석된 `tenant_id`를 받지만, `resolve_binding(binding_key)`은 게이트웨이가 tenant를 얻기 위해 호출하는 **preflight 예외 계약**이다.
-- **권한 판정(하이브리드)** — 어댑터가 만든 표준 신원으로 "이 신원이 이 tenant에 접근 가능한가"를 일괄 판정. 인증 수단 차이는 어댑터가 흡수. (민감 작업은 어댑터의 실시간 신원 갱신 정책으로 처리.)
-- **존재/권한 에러 정규화** — 외부 표면에는 `binding 없음`과 `권한 없음`을 구분해 노출하지 않는다. 내부 감사 로그에만 원인을 기록한다.
-- **계약 호출(혼합)** — 즉답형(`query`·`discover`)은 코어 동기 API, 장기 작업(`ingest`·재색인)은 큐 + 완료 콜백.
-- **작업 상태 관리** — 게이트웨이가 표면 무관 `job_id`를 생성해 코어에 전달하고, 자체 상태 저장소에 UX 상태(접수/진행/완료/실패)와 코어 처리 상태를 매핑한다.
-- **응답 정규화** — 코어의 표면 무관 결과(`{answer, sources, grounded/supplemented}`)를 어댑터가 렌더할 표준형으로 변환.
+| Package | 현재 역할 |
+|---------|-----------|
+| `pkg/brainapi` | control plane과 data core가 공유하는 표면 무관 계약 |
+| `internal/control/frontend` | `create`, `ingest`, `ask`, `discover`, `status`, `admin` 텍스트 커맨드 dispatcher |
+| `internal/control/gateway` | authorization, binding resolution, source loading orchestration, job ID/tenant ID 생성 |
+| `internal/control/jobs` | in-memory job ledger와 core `JobStatus` reconcile |
+| `internal/control/sources` | `file`, `http`, `https`, `text`, `raw`, inline metadata, plain text source loader |
+| `internal/control/httpapi` | `POST /api/commands` bearer-token JSON adapter |
+| `internal/control/slack` | `POST /slack/commands`, `POST /slack/interactions`, manifest JSON 생성 |
+| `internal/control/ops` | `/healthz`, `/readyz` |
+| `internal/core/memory` | local in-memory RAG core와 optional `$DATA_PATH/memory.json` snapshot |
+| `internal/core/ai` | optional local/OpenAI-compatible provider seam. 기본 server path에는 필요 없다. |
+| `internal/platform/config` | 환경변수 파싱과 검증 |
+| `internal/platform/server` | HTTP server와 graceful shutdown |
+| `cmd/workspace-brain` | runtime wiring, route mount, demo flow |
 
 ---
 
-## 4. Slack 어댑터
+## 3. Adapter contract
 
-**단일 Slack 앱**에 슬래시 커맨드·Events·Interactivity·Workflow를 모두 등록한다. 관리 권한 제한은 Slack scope가 아니라 게이트웨이 권한 판정으로 강제한다.
+Adapter는 표면 고유 정보를 이 경계에서 멈춘다.
 
-| 요소 | 역할 |
-|------|------|
-| 슬래시 `/brain` | `create`·`ingest`·`ask`·`discover`·`status` 서브커맨드 파싱 |
-| Events API | 파일·이벤트 수신 |
-| Interactivity | "채널에 공유" 버튼 등 버튼 액션 |
-| Workflow | 폼 기반 수집 입력 → 동일 수집 경로로 수렴 |
-| 서명 검증 | 모든 웹훅 진입부 |
-| 3초 ack + `response_url` | 즉시 ack 후 후속 응답 |
-| 신원 생성 | Slack 서명·멤버십 → 표준 신원(민감 작업만 실시간) |
-| 렌더링 | block kit, 기본 ephemeral + 공유 버튼, 근거/보완 구분 표시 |
+### Adapter가 해야 할 일
 
-### 커맨드 이름 (COMMAND_NAME)
+1. 표면 요청을 인증한다.
+2. 표면 신원을 `brainapi.Principal{Source, ID, Roles}`로 만든다.
+3. 표면 위치를 `brainapi.BindingKey`로 만든다.
+4. 사용자 명령 텍스트를 `frontend.Request.Text`에 넣는다.
+5. `frontend.Dispatcher.Handle`을 호출한다.
+6. `frontend.Response` 또는 `frontend.SafeMessage(err)`를 표면 응답으로 렌더링한다.
 
-최상위 커맨드 이름은 환경변수 `COMMAND_NAME`로 관리한다. 기본값은 **`brain`**(즉 `/brain`). 코드(라우팅·파싱·응답 메시지)는 이 값을 참조하고, Slack 매니페스트도 이 값에서 생성한다(manifest-as-code).
+### Adapter가 하면 안 되는 일
 
-**등록 후 잠금** — Slack에 커맨드가 한 번 등록되면 런타임에서 이름을 바꿀 수 없다.
+- tenant ID를 직접 해석하지 않는다.
+- `brainapi.Core`를 직접 호출하지 않는다.
+- Slack channel, HTTP header, Web session 같은 표면 필드를 gateway 아래로 넘기지 않는다.
+- 존재하지 않는 binding과 권한 실패를 사용자에게 구분해 노출하지 않는다.
 
-- 최초 등록 시점의 이름을 **잠금(lock)으로 영속 기록**한다.
-- 부팅 시 `COMMAND_NAME`이 잠금에 기록된 이름과 다르면 **시작을 거부**한다(등록된 Slack 커맨드와 코드가 어긋나 커맨드가 미인식되는 사고 방지).
-- 이름을 바꾸려면 환경변수만 바꾸는 게 아니라 **매니페스트 재등록을 포함한 명시적 재배포 절차**를 거쳐 잠금을 갱신한다.
+### 현재 adapters
 
-서브커맨드(`create`·`ingest`·`ask`·`discover`·`status`)는 텍스트 인자라 별도 등록이 필요 없다. 사전 등록 제약이 없는 향후 표면(웹·API)은 이름을 더 자유롭게 둘 수 있다.
+| Adapter | Route | 인증 | BindingKey | Principal |
+|---------|-------|------|------------|-----------|
+| Slack slash command | `POST /slack/commands` | Slack HMAC timestamp signature | `slack:channel:<channel_id>` | `Source:"slack"`, `ID:<user_id>`, roles `member` plus configured `admin` |
+| Slack interactivity | `POST /slack/interactions` | Slack HMAC timestamp signature | 현재 dispatcher로 전달하지 않고 접수만 응답 | 현재 dispatcher로 전달하지 않음 |
+| JSON HTTP | `POST /api/commands` | `Authorization: Bearer <API_TOKEN>` | JSON body의 `binding_key` | JSON body의 `principal` |
 
 ---
 
-## 5. 코어 통신 (혼합)
+## 4. Command flow
+
+### 4.1 Project creation
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    actor U as 사용자
-    participant SA as Slack 어댑터
-    participant GW as 공통 게이트웨이
-    participant CORE as 데이터 코어
-    participant JS as 작업 상태 저장소
+    actor U as User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant C as Core
 
-    Note over U,CORE: 프로젝트 생성 = 동기 API + 원자적 프로비저닝
-    U->>SA: /brain create <이름>
-    SA->>SA: 서명 검증 · 관리자 신원 생성
-    SA-->>U: 3초 ack
-    SA->>GW: 표준 요청 (binding_key·owner_principal·metadata)
-    GW->>GW: tenant_id 생성 · 생성 권한 판정
-    GW->>CORE: create_project(tenant_id, binding_key, owner_principal, metadata)
-    CORE-->>GW: ok 또는 중복/부분실패 rollback 결과
-    GW->>SA: 정규화 응답
-    SA->>U: response_url (생성 완료/실패)
-
-    Note over U,CORE: 즉답형 (조회·메타데이터) = resolve preflight + 동기 API
-    U->>SA: /brain ask <질문>
-    SA->>SA: 서명 검증 · 신원 생성
-    SA-->>U: 3초 ack
-    SA->>GW: 표준 요청 (binding_key·identity·question)
-    GW->>CORE: resolve_binding(binding_key) → tenant_id
-    GW->>GW: 권한 판정 · 존재/권한 에러 정규화
-    GW->>CORE: query(tenant_id, question)  [동기]
-    CORE-->>GW: {answer, sources, grounded/supplemented}
-    GW->>SA: 정규화 응답
-    SA->>U: response_url (ephemeral + 공유 버튼)
-
-    Note over U,JS: 장기 작업 (수집·재색인) = gateway job_id + 큐 + 완료 콜백
-    U->>SA: /brain ingest (파일+메타) · Workflow
-    SA->>SA: 서명 검증 · 신원 생성
-    SA-->>U: 3초 ack
-    SA->>GW: 표준 요청
-    GW->>CORE: resolve_binding(binding_key) → tenant_id
-    GW->>GW: 권한 판정 · job_id 생성
-    GW->>JS: job 등록 (접수)
-    GW->>CORE: ingest(tenant_id, job_id, source_ref, metadata)  [큐]
-    CORE-->>GW: accepted
-    GW->>JS: 상태 갱신 (진행)
-    GW->>SA: 접수 통지
-    SA->>U: response_url (작업 ID)
-    CORE-->>GW: 완료/실패 콜백 (job_id)
-    GW->>JS: 상태 갱신
-    GW->>SA: 후속 통지
-    SA->>U: response_url (완료/실패)
+    U->>A: create <name>
+    A->>A: verify surface auth
+    A->>D: Request(binding_key, principal, text)
+    D->>G: CreateProject(binding_key, principal, metadata)
+    G->>G: authorize create_project
+    G->>G: generate tenant_id
+    G->>C: CreateProject(tenant_id, binding_key, owner_principal, metadata)
+    C-->>G: ok
+    G-->>D: tenant_id
+    D-->>A: private response
+    A-->>U: rendered response
 ```
 
-> 장기 작업은 게이트웨이가 만든 표면 무관 `job_id`를 코어에도 전달한다. 코어 → 게이트웨이 **역방향 완료 콜백**은 빠른 UX를 위한 기본 경로이고, 콜백 유실 시 게이트웨이는 코어 `get_job_status`로 재동기화한다.
+`create`는 admin 권한이 필요하다. gateway는 `crypto/rand`를 이용해 `tenant-<32-hex-chars>` 형식의 무작위 ID를 생성한다.
+
+### 4.2 Ingest
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant L as Source Loader
+    participant J as Job Ledger
+    participant C as Core
+
+    U->>A: ingest <source>
+    A->>D: Request(binding_key, principal, text)
+    D->>G: Ingest(binding_key, principal, source_ref)
+    G->>C: ResolveBinding(binding_key)
+    G->>G: authorize ingest
+    G->>G: generate job_id
+    G->>J: PutAccepted(tenant_id, job_id)
+    G->>L: Load source when metadata lacks content
+    L-->>G: metadata[content]
+    G->>C: Ingest(tenant_id, job_id, source_ref, metadata)
+    C-->>G: running
+    G->>J: MarkRunning
+    G-->>D: job_id
+    D-->>A: accepted response
+```
+
+지원 source 형식:
+
+- `file:///absolute/path`
+- `http://...` and `https://...`
+- `text://...`, `text:...`
+- `raw://...`, `raw:...`
+- metadata keys `inline_content`, `inline`, `raw`, `text`
+- plain or unknown-scheme URI as text fallback
+
+기본 loader는 1 MiB read limit과 5초 network timeout을 적용한다.
+
+### 4.3 Query and discovery
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant C as Core
+
+    U->>A: ask <question> / discover <query>
+    A->>D: Request(binding_key, principal, text)
+    D->>G: Ask or Discover
+    G->>C: ResolveBinding(binding_key)
+    G->>G: authorize query/discover
+    G->>C: Query or Discover(tenant_id, input)
+    C-->>G: answer with sources or metadata-only results
+    G-->>D: response
+    D-->>A: private text
+```
+
+`ask`는 grounded answer, sources, grounded spans를 반환한다. `discover`는 metadata만 반환하고 chunk text를 노출하지 않는다.
+
+### 4.4 Status and admin
+
+`status <job_id>`는 gateway에서 binding을 tenant로 해석하고 권한을 확인한 뒤 core `JobStatus`로 reconcile한다. 결과는 job ledger에 저장된다.
+
+`admin on|off <tenant_id>`는 dispatcher의 optional admin capability를 사용한다. Gateway는 `admin` action을 authorize한 뒤 core `SetProjectState`를 호출한다. `off` 상태는 데이터를 보존하면서 serving 작업을 막는다.
 
 ---
 
-## 6. 에러·타임아웃 UX (풀)
+## 5. Auth and tenant isolation
 
-혼합 통신에서 코어 지연·실패·콜백 유실에 대비한다.
+- Adapter authentication은 요청 출처를 검증한다.
+- Gateway authorization은 `Principal`, `Action`, `TenantID`/`BindingKey` 조합을 검증한다.
+- 현재 `RoleAuthorizer`는 `admin`에게 모든 권한을 주고, `member`에게 기존 tenant read/write 작업을 허용한다.
+- `create_project`와 `admin` action은 `admin` role이 필요하다.
+- `ResolveBinding(binding_key)`만 surface binding을 tenant로 바꾸는 preflight 예외다.
+- Gateway는 not found와 unauthorized를 `SafeAccessError`로 통합한다.
+- Job 상태는 항상 `(tenant_id, job_id)` scope로 저장·조회한다.
 
-- **접수 확인** — 장기 작업은 게이트웨이가 만든 작업 ID와 함께 "접수됨".
-- **단계 알림** — 진행/완료/실패를 `response_url`로 통지.
-- **타임아웃 보정** — 완료 콜백이 일정 시간 안 오면 먼저 코어 `get_job_status`로 재조회하고, 확인 불가할 때만 실패/확인필요 상태로 안내.
-- **상태 조회** — `/brain status <작업ID>`는 Control Plane 상태 저장소를 우선 조회하고, stale 상태면 코어 상태와 reconcile한다.
-- **재시도** — 실패 작업 재실행(동일 `job_id` 재사용 금지, 원본 작업 참조 + 신규 `job_id`; 코어 멱등성·DLQ와 연계).
-- **상태 저장소** — 위를 위해 Control Plane이 작업 상태를 자체 영속 저장하되, 코어 처리 상태와 동기화 가능한 참조를 보관한다.
+Production extension: role 정책, membership refresh, audit log, tenant allowlist는 같은 gateway seam 뒤에서 강화한다.
 
 ---
 
-## 7. 결정 요약 (Control Plane)
+## 6. Persistence model
 
-| # | 항목 | 결정 |
-|---|------|------|
-| 1 | 코어 통신 | 혼합 (즉답=동기 API, 장기=큐+완료 콜백) |
-| 2 | 표면 범위 | 처음부터 다중 표면 설계 (어댑터 + 공통 게이트웨이) |
-| 3 | 채널→tenant 해석 | 공통 게이트웨이 preflight (`resolve_binding`, 표면 무관 바인딩 키) |
-| 4 | 인증·권한 | 하이브리드 (신원=어댑터, 권한=게이트웨이, 존재/권한 에러 외부 정규화) |
-| 5 | Slack 앱 | 단일 앱 (관리 권한은 게이트웨이가 강제) |
-| 6 | 에러·타임아웃 UX | 풀 (gateway `job_id`·상태 조회·재동기화·재시도, 자체 상태 저장소) |
+현재 구현은 local-first다.
 
-## 8. 슬래시 커맨드 세트
+| State | 현재 저장소 |
+|-------|-------------|
+| Binding catalog | memory core map, optional JSON snapshot |
+| Project metadata/state | memory core map, optional JSON snapshot |
+| Source refs and document content | memory core map, optional JSON snapshot |
+| Chunks/vectors | in-memory rebuild from persisted docs |
+| Core job status | memory core map, optional JSON snapshot |
+| Control-plane job ledger | process memory only |
 
-| 커맨드 | 용도 |
-|--------|------|
-| `/brain create` | 프로젝트 생성 + 채널 자동 바인딩 |
-| `/brain ingest` | 데이터 수집 (Workflow와 동일 경로) |
-| `/brain ask` | 질의 |
-| `/brain discover` | 보조 교차 탐색 (메타데이터만) |
-| `/brain status` | 작업 상태 조회 |
+`DATA_PATH`를 설정하면 server는 디렉터리를 만들고 memory core가 `$DATA_PATH/memory.json`에 atomic JSON snapshot을 쓴다. `DATA_PATH`가 없으면 모든 상태는 프로세스 메모리에 남는다.
 
-`/brain create`는 게이트웨이가 `tenant_id`를 생성하고, Slack 어댑터가 만든 `binding_key`와 표준 소유자 신원(`owner_principal`)을 함께 코어 `create_project`에 전달한다. 코어는 바인딩 중복, collection/schema 생성, catalog 등록을 한 원자적 프로비저닝 단위로 처리한다.
+Roadmap/extension:
 
-## 9. 미해결 / 가드레일
+- durable control-plane job store
+- external tenant/binding catalog
+- durable source/chunk/vector stores
+- migrations, backup, multi-process locks
 
-- **콜백 신뢰성** — 완료 콜백 유실 대비 타임아웃·`get_job_status` 재조회 정책의 주기·상한 결정 필요.
-- **작업 상태 저장소 선택** — Control Plane 자체 경량 저장소(예: Redis/PostgreSQL) 결정 필요.
-- **Admin 표면** — 최소 웹 + Slack 혼합으로 "가능" 수준만. 상세 후속.
-- **응답 공유 버튼** — Slack interactivity 엔드포인트 필요.
-- **신원 토큰 수명** — 멤버십 캐시 TTL과 민감 작업 실시간 검증 경계 정의.
-- **생성 권한 정책** — 누가 `/brain create`를 실행할 수 있는지, workspace/admin/allowlist 기준 결정 필요.
+---
+
+## 7. Operational endpoints
+
+`cmd/workspace-brain`는 설정된 adapter에 따라 route를 mount한다.
+
+| Endpoint | Method | Mount condition | 현재 동작 |
+|----------|--------|-----------------|-----------|
+| `/healthz` | GET | 항상 | liveness JSON 반환. dependency check 없음 |
+| `/readyz` | GET | 항상 | `READINESS_REQUIRED=true`이면 `DATA_PATH` 상태 확인 |
+| `/api/commands` | POST | `API_TOKEN` 설정 | bearer-token JSON command adapter |
+| `/slack/commands` | POST | `SLACK_SIGNING_SECRET` 설정 | Slack slash command adapter |
+| `/slack/interactions` | POST | `SLACK_SIGNING_SECRET` 설정 | Slack signature 검증 후 접수 응답 |
+| `/slack/manifest.json` | GET | `SLACK_SIGNING_SECRET` and HTTPS `PUBLIC_BASE_URL` 설정 | deterministic Slack app manifest JSON |
+
+Server mode는 최소 하나의 frontend adapter를 요구한다. `SLACK_SIGNING_SECRET`과 `API_TOKEN`이 모두 없으면 설정 검증이 실패한다. `go run ./cmd/workspace-brain demo`는 HTTP adapter 없이 in-process demo flow를 실행한다.
+
+---
+
+## 8. Slack adapter details
+
+Slack은 frontend adapter다. Slack 중심 제어 표면이 아니다.
+
+현재 Slack 구현:
+
+- slash command endpoint에서 method, body size, timestamp, HMAC signature를 검증한다.
+- `COMMAND_NAME` 기본값은 `brain`이며 요청 command가 `/<COMMAND_NAME>`과 다르면 거부한다.
+- channel ID를 `slack:channel:<channel_id>` binding으로 바꾼다.
+- user ID를 `Principal{Source:"slack", ID:<user_id>, Roles:["member"]}`로 바꾼다.
+- `ADMIN_USERS`에 포함된 Slack user ID에는 `admin` role을 추가한다.
+- 응답은 현재 ephemeral text JSON으로 렌더링한다.
+- interactivity endpoint는 서명 검증 후 "접수" 응답만 반환한다.
+- manifest generator는 slash command와 interactivity URL을 포함한 JSON을 만든다.
+
+Roadmap/extension:
+
+- Slack Events API file intake
+- Workflow form intake
+- delayed `response_url` follow-up messages
+- rich Block Kit rendering and share buttons
+- registered-command lock file or deployment lock workflow
+
+---
+
+## 9. Adding a new adapter
+
+새 adapter는 `internal/control/<surface>`에 두고 기존 dispatcher/gateway를 재사용한다.
+
+체크리스트:
+
+1. 표면 인증을 구현한다.
+2. 표면 identity를 `brainapi.Principal`로 변환한다.
+3. 표면 location을 `brainapi.BindingKey`로 변환한다.
+4. user command를 `frontend.Request.Text`로 전달한다.
+5. `frontend.NewDispatcher(gateway).Handle(ctx, req)`를 호출한다.
+6. response visibility와 text를 표면 UX에 맞게 렌더링한다.
+7. route wiring을 `cmd/workspace-brain` 또는 별도 entrypoint에 추가한다.
+8. tests: auth failure, malformed request, safe access error, successful command path.
+
+새 adapter는 core contract를 바꾸지 않는다.
+
+---
+
+## 10. Decision summary
+
+| # | 항목 | 현재 결정 |
+|---|------|-----------|
+| 1 | 표면 모델 | Slack 단일 표면이 아니라 frontend adapter boundary |
+| 2 | 공통 명령 처리 | `internal/control/frontend` dispatcher |
+| 3 | tenant 해석 | gateway가 `ResolveBinding(binding_key)` preflight 수행 |
+| 4 | 인증/권한 | adapter authentication + gateway authorization |
+| 5 | source ingest | gateway source loader가 content metadata를 채운 뒤 core ingest |
+| 6 | 작업 상태 | gateway job ID + in-memory job ledger + core status reconcile |
+| 7 | persistence | local memory core, optional `$DATA_PATH/memory.json`; control job ledger는 in-memory |
+| 8 | 운영 route | `/healthz`, `/readyz`, `/api/commands`, `/slack/commands`, `/slack/interactions`, `/slack/manifest.json` |

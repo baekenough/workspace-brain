@@ -165,6 +165,63 @@ type JobSnapshot struct {
 	UpdatedAt time.Time
 }
 
+// TenantInfo is an admin-surface metadata summary of a single tenant.
+// It omits owner role details and chunk content to limit sensitive exposure.
+type TenantInfo struct {
+	TenantID  TenantID
+	State     ProjectState
+	OwnerID   string
+	CreatedAt time.Time
+}
+
+// BindingInfo is an admin-surface summary of a single surface binding.
+type BindingInfo struct {
+	BindingKey BindingKey
+	TenantID   TenantID
+}
+
+// SourceInfo is an admin-surface metadata summary of a source.
+// It deliberately omits chunk text content.
+type SourceInfo struct {
+	ID        string
+	TenantID  TenantID
+	Name      string
+	URI       string
+	MimeType  string
+	CreatedAt time.Time
+}
+
+// AdminListTenantsRequest enumerates all provisioned tenants.
+// It carries no required fields; future versions may add pagination cursors.
+type AdminListTenantsRequest struct{}
+
+// AdminListTenantsResponse carries tenant summaries for all provisioned tenants.
+type AdminListTenantsResponse struct {
+	Tenants []TenantInfo
+}
+
+// AdminListBindingsRequest enumerates bindings.
+// When TenantID is non-empty only bindings for that tenant are returned.
+type AdminListBindingsRequest struct {
+	TenantID TenantID // empty = all tenants
+}
+
+// AdminListBindingsResponse carries all matching binding summaries.
+type AdminListBindingsResponse struct {
+	Bindings []BindingInfo
+}
+
+// AdminListSourcesResponse carries source metadata summaries for a single tenant.
+// Chunk content is never included.
+type AdminListSourcesResponse struct {
+	Sources []SourceInfo
+}
+
+// AdminListJobsResponse carries job snapshots for a single tenant.
+type AdminListJobsResponse struct {
+	Jobs []JobSnapshot
+}
+
 // Core is the platform data-core contract. Implementations must stay surface-neutral.
 type Core interface {
 	ResolveBinding(ctx context.Context, binding BindingKey) (TenantID, error)
@@ -174,4 +231,26 @@ type Core interface {
 	Query(ctx context.Context, req QueryRequest) (QueryResponse, error)
 	Discover(ctx context.Context, req DiscoverRequest) (DiscoverResponse, error)
 	SetProjectState(ctx context.Context, tenantID TenantID, state ProjectState) error
+
+	// Admin read operations — callers must hold ActionAdmin.
+	// Implementations use the admin sentinel (GUC '*' in Postgres, or full map
+	// access in memory) to enumerate across tenants without checking project state.
+
+	// AdminListTenants returns metadata summaries for all provisioned tenants.
+	AdminListTenants(ctx context.Context, req AdminListTenantsRequest) (AdminListTenantsResponse, error)
+
+	// AdminListBindings returns binding summaries, optionally filtered by tenant.
+	AdminListBindings(ctx context.Context, req AdminListBindingsRequest) (AdminListBindingsResponse, error)
+
+	// AdminListSources returns source metadata for a specific tenant (no chunk content).
+	// The implementation must not check project state.
+	AdminListSources(ctx context.Context, tenantID TenantID) (AdminListSourcesResponse, error)
+
+	// AdminListJobs returns job snapshots for a specific tenant.
+	// The implementation must not check project state.
+	AdminListJobs(ctx context.Context, tenantID TenantID) (AdminListJobsResponse, error)
+
+	// AdminGetJob returns a single job snapshot for the given tenant and job.
+	// The implementation must not check project state.
+	AdminGetJob(ctx context.Context, tenantID TenantID, jobID JobID) (JobSnapshot, error)
 }

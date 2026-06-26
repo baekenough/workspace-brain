@@ -1,163 +1,326 @@
-# workspace-brain 아키텍처
+# workspace-brain Architecture
 
-이 문서는 현재 Go walking skeleton이 어떤 아키텍처 결정을 코드로 고정하는지 설명합니다. 상세 설계는 `docs/` 아래 문서를 기준으로 하고, 이 파일은 구현 관점의 빠른 지도를 제공합니다.
+workspace-brain separates user-facing surfaces from tenant-scoped RAG data operations.
 
-## 한 줄 요약
+The boundary rule is strict:
 
-workspace-brain은 **표면 어댑터 → 공통 게이트웨이 → 표면 무관 데이터 코어**로 나뉘는 멀티테넌트 RAG 플랫폼입니다.
+> Slack is one frontend adapter. Gateway and Data Core do not know whether a request came from Slack, JSON HTTP, Web, CLI, or an admin UI.
 
-핵심 원칙은 다음입니다.
+The current runtime implements a surface-neutral command gateway, a local memory core, and adapter boundaries for Slack and token-protected JSON HTTP. Future surfaces attach at the same frontend adapter seam.
 
-> **Data Core는 호출자가 Slack인지, Web인지, CLI인지 모른다.**
-
-Slack channel, `response_url`, slash command, block kit 같은 표면 고유성은 adapter에 가둡니다. Core는 `tenant_id`, `job_id`, `source_ref`, `question` 같은 표면 무관 값만 받습니다.
-
-## 계층 구조
+## Layer model
 
 ```mermaid
 flowchart TB
-    U[사용자]
-    SA[Slack Adapter]
+    U[User or client]
+
+    subgraph FrontendAdapters[Frontend adapters]
+        Slack[Slack adapter]
+        HTTP[JSON HTTP adapter]
+        Future[Future Web / CLI / admin adapters]
+    end
+
+    FD[Frontend Dispatcher]
     GW[Control Gateway]
-    JS[Job Store]
-    CORE[Data Core Contract]
-    MEM[Memory Core]
+    Jobs[Control Job Ledger]
+    Loader[Source Loader]
 
-    U --> SA
-    SA --> GW
-    GW --> JS
-    GW --> CORE
-    CORE --> MEM
+    subgraph Core[Data Core Contract]
+        Local[Local Memory RAG Core]
+        Prod[Future durable / remote core adapters]
+    end
+
+    U --> Slack
+    U --> HTTP
+    U --> Future
+    Slack --> FD
+    HTTP --> FD
+    Future --> FD
+    FD --> GW
+    GW --> Jobs
+    GW --> Loader
+    GW --> Local
+    GW -. same brainapi.Core contract .-> Prod
 ```
 
-## 현재 Go 패키지 매핑
-
-| 패키지 | 책임 |
-|---|---|
-| `pkg/brainapi` | Control Plane과 Data Core가 공유하는 표면 무관 계약 |
-| `internal/control/gateway` | binding 해석, 권한 판정, job 생성, Core 호출 |
-| `internal/control/jobs` | Control Plane 자체 job 상태 저장소 |
-| `internal/control/slack` | Slack slash-command HTTP adapter |
-| `internal/core/memory` | 테스트/데모용 in-memory Data Core |
-| `cmd/workspace-brain` | 서버/데모 실행 진입점 |
-
-## 요청 흐름
-
-### `/brain create`
-
-```mermaid
-sequenceDiagram
-    actor U as 사용자
-    participant S as Slack Adapter
-    participant G as Gateway
-    participant C as Core
-
-    U->>S: /brain create Demo
-    S->>S: Slack 서명 검증
-    S->>G: CreateProject(binding_key, principal, metadata)
-    G->>G: 생성 권한 확인 + tenant_id 생성
-    G->>C: create_project(tenant_id, binding_key, owner_principal, metadata)
-    C-->>G: ok
-    G-->>S: tenant_id
-    S-->>U: 생성 완료
-```
-
-구현 위치:
-
-- `internal/control/slack/handler.go`
-- `internal/control/gateway/gateway.go`
-- `internal/core/memory/core.go`
-
-### `/brain ingest`
-
-```mermaid
-sequenceDiagram
-    actor U as 사용자
-    participant S as Slack Adapter
-    participant G as Gateway
-    participant J as Job Store
-    participant C as Core
-
-    U->>S: /brain ingest file://a.pdf
-    S->>G: Ingest(binding_key, principal, source_ref)
-    G->>C: resolve_binding(binding_key)
-    G->>G: 권한 판정 + job_id 생성
-    G->>J: accepted 저장
-    G->>C: ingest(tenant_id, job_id, source_ref, metadata)
-    C-->>G: accepted
-    G->>J: running 저장
-    G-->>S: job_id
-    S-->>U: 접수 완료
-```
-
-중요 결정:
-
-- `job_id`는 Gateway가 생성합니다.
-- Core는 전달받은 `job_id`를 멱등성 키와 callback 식별자로 사용합니다.
-- Control Plane은 Core와 별개로 UX용 job state를 저장합니다.
-
-### `/brain status`
-
-```mermaid
-sequenceDiagram
-    actor U as 사용자
-    participant S as Slack Adapter
-    participant G as Gateway
-    participant J as Job Store
-    participant C as Core
-
-    U->>S: /brain status job-1
-    S->>G: Status(binding_key, principal, job_id, reconcile=true)
-    G->>C: resolve_binding(binding_key)
-    G->>G: 권한 판정
-    G->>C: get_job_status(tenant_id, job_id)
-    G->>J: reconcile 저장
-    G-->>S: status
-    S-->>U: 상태 응답
-```
-
-## 보안/격리 원칙
-
-현재 skeleton에서 테스트로 고정한 원칙입니다.
-
-1. **binding 존재 여부와 권한 없음은 외부 표면에 구분해서 노출하지 않는다.**
-   - Gateway는 `binding not found`와 `unauthorized`를 safe access error로 정규화합니다.
-
-2. **job 상태는 `(tenant_id, job_id)` 범위로 조회한다.**
-   - 같은 `job_id`라도 tenant가 다르면 다른 작업입니다.
-
-3. **Core는 surface identity를 직접 판단하지 않는다.**
-   - Core는 이미 검증된 `tenant_id`만 신뢰합니다.
-   - `resolve_binding`만 tenant 해석용 preflight 예외입니다.
-
-4. **Slack 요청은 signature 검증 후 처리한다.**
-   - timestamp freshness와 HMAC SHA-256 signature를 검증합니다.
-
-## 테스트 전략
-
-| 범주 | 예시 |
-|---|---|
-| Contract validation | binding key, tenant id, job id 검증 |
-| Gateway security | missing binding / unauthorized safe error 정규화 |
-| Job lifecycle | accepted → running → completed/failed |
-| Tenant isolation | tenant별 source/job 분리 |
-| Slack adapter | signature 검증, command dispatch, safe message |
-| Race safety | in-memory store/core mutex 기반 동시 접근 |
-
-## 확장 계획
-
-현재 구현은 외부 의존성이 없는 skeleton입니다. 다음 단계에서는 interface 뒤에 실제 adapter를 붙입니다.
-
-| 영역 | 현재 | 다음 단계 |
+| Layer | Current implementation | Responsibility |
 |---|---|---|
-| 데이터 저장 | `internal/core/memory` | PostgreSQL + RLS |
-| 벡터 저장 | 없음 | Qdrant tenant collection |
-| 큐 | 없음 | RabbitMQ + DLQ |
-| 임베딩 | 없음 | OpenAI `text-embedding-3-large` adapter |
-| Slack | slash-command handler | manifest-as-code + interactivity |
-| Admin | 없음 | 최소 web/admin command |
+| Frontend adapter | `internal/control/slack`, `internal/control/httpapi` | Verify surface-local authentication, normalize identity and location, call the dispatcher, render a surface response. |
+| Frontend dispatcher | `internal/control/frontend` | Parse shared text commands and call gateway methods. It owns command grammar, not tenant policy. |
+| Control gateway | `internal/control/gateway` | Resolve bindings, authorize actions, generate `tenant_id`/`job_id`, load source content when needed, normalize safe access errors, and reconcile job status. |
+| Control job ledger | `internal/control/jobs` | Keep in-memory UX job state under `(tenant_id, job_id)` and reconcile it with core job status. |
+| Data core contract | `pkg/brainapi` | Define surface-neutral tenant, binding, source, query, discovery, job, and project-state types. |
+| Local memory core | `internal/core/memory` | Provide the committed local RAG runtime and optional JSON snapshot persistence. |
+| Platform | `internal/platform/config`, `internal/platform/server` | Parse process configuration and run the hardened HTTP server. |
 
-## 관련 문서
+## Boundary responsibilities
 
-- `docs/workspace-brain-control-plane-architecture.md`
-- `docs/workspace-brain-data-architecture.md`
+| Boundary | Responsibility | Must not do |
+|---|---|---|
+| Frontend adapter | Verify surface-specific auth, create `Principal`, create `BindingKey`, pass text command to the dispatcher | Decide tenant authorization, call Data Core directly, leak Slack/Web/CLI-only fields downstream |
+| Frontend dispatcher | Parse `create`, `ingest`, `ask`, `discover`, `status`, and optional `admin` commands; render surface-neutral response text | Know Slack signatures, own tenant/job state, synthesize RAG answers |
+| Control gateway | Resolve bindings, authorize actions, generate IDs, run source loading, call `brainapi.Core`, normalize access errors | Know Slack/Web payloads, parse HTTP/Slack requests, synthesize RAG answers |
+| Job ledger | Store control-plane async job state for user-facing status and reconciliation | Store tenant source content or grounded chunks |
+| Source loader | Resolve bounded ingest content from supported source references | Make tenant authorization decisions or persist core data |
+| Data Core | Manage tenant-scoped project state, ingest, retrieval, answer/discovery, and core job state | Know which frontend adapter called it, trust unscoped identity, render surface-specific UI |
+
+## Package map
+
+| Package | Role |
+|---|---|
+| `pkg/brainapi` | Surface-neutral contract shared by Control Gateway and Data Core. |
+| `internal/control/frontend` | Shared command dispatcher and optional admin capability seam. |
+| `internal/control/gateway` | Binding resolution, authorization, source loading, job orchestration, and safe errors. |
+| `internal/control/jobs` | In-memory control-plane job ledger with core reconciliation. |
+| `internal/control/sources` | Bounded `file`, `http`, `https`, `text`, `raw`, inline metadata, and fallback text source loader for ingest metadata. |
+| `internal/control/httpapi` | Bearer-token JSON frontend adapter at `/api/commands`. |
+| `internal/control/slack` | Slack signature verification, slash command handling, interactivity acknowledgement, and manifest-as-code. |
+| `internal/control/ops` | Health and readiness HTTP endpoints. |
+| `internal/core/ai` | Optional local and OpenAI-compatible provider seams; not required by the default memory runtime. |
+| `internal/core/memory` | Local-first in-memory RAG implementation with optional JSON snapshot persistence. |
+| `internal/platform/config` | Typed environment parsing and validation. |
+| `internal/platform/server` | HTTP server construction and graceful shutdown helper. |
+| `cmd/workspace-brain` | Runtime wiring, HTTP route registration, and demo flow. |
+
+## Identity and binding model
+
+- `Principal` is adapter-created identity, for example `slack:U123`, `web:U1`, or `cli:alice` via `Principal{Source, ID, Roles}`.
+- `BindingKey` is adapter-created location, for example `slack:channel:C123`, `api:workspace:demo`, or `web:space:S1`.
+- `TenantID` is generated by the gateway during project creation as a random hex string, for example `tenant-3c4997260a941958762c934928ad17ba`.
+- `JobID` is generated by the gateway for ingest work as a random hex string, for example `job-616eec1b005fb0258433d73b843f8380`.
+- Data Core receives `TenantID`; it does not inspect Slack channels, HTTP sessions, or CLI arguments.
+- Missing binding and unauthorized access collapse to the same safe access error at the gateway/frontend boundary.
+
+## Command flow
+
+### Create project
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant C as Data Core
+
+    User->>A: create Demo
+    A->>A: verify surface auth/signature/token
+    A->>D: Request(binding_key, principal, text)
+    D->>G: CreateProject(binding_key, principal, metadata)
+    G->>G: authorize create + generate tenant_id
+    G->>C: CreateProject(tenant_id, binding_key, owner_principal)
+    C-->>G: ok
+    G-->>D: tenant_id
+    D-->>A: private response text
+    A-->>User: created
+```
+
+### Ingest and query
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant L as Source Loader
+    participant J as Job Ledger
+    participant C as Data Core
+
+    User->>A: ingest <source-uri-or-text>
+    A->>D: Request(binding_key, principal, text)
+    D->>G: Ingest(binding_key, principal, source_ref)
+    G->>C: ResolveBinding(binding_key)
+    G->>G: authorize ingest + generate job_id
+    G->>J: accepted
+    G->>L: load source content when metadata lacks content
+    L-->>G: metadata[content]
+    G->>C: Ingest(tenant_id, job_id, source_ref, metadata)
+    C-->>G: running
+    G->>J: running
+    G-->>D: job_id
+
+    User->>A: ask <question>
+    A->>D: Request(binding_key, principal, text)
+    D->>G: Ask(binding_key, principal, question)
+    G->>C: ResolveBinding(binding_key)
+    G->>G: authorize query
+    G->>C: Query(tenant_id, question)
+    C-->>G: grounded answer + sources + spans
+    G-->>D: QueryResponse
+    D-->>A: private response text
+```
+
+### Status and admin state
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant A as Frontend Adapter
+    participant D as Dispatcher
+    participant G as Gateway
+    participant J as Job Ledger
+    participant C as Data Core
+
+    User->>A: status job-616eec1b005fb0258433d73b843f8380
+    A->>D: Request(binding_key, principal, text)
+    D->>G: Status(binding_key, principal, job_id, reconcile=true)
+    G->>C: ResolveBinding(binding_key)
+    G->>G: authorize status
+    G->>C: JobStatus(tenant_id, job_id)
+    C-->>G: core job snapshot
+    G->>J: store reconciled snapshot
+    G-->>D: status text
+
+    User->>A: admin off tenant-3c4997260a941958762c934928ad17ba
+    A->>D: Request(principal, text)
+    D->>G: SetProjectState(tenant_id, off)
+    G->>G: authorize admin
+    G->>C: SetProjectState(tenant_id, off)
+    C-->>G: ok
+    G-->>D: state changed
+```
+
+## Frontend adapter contract
+
+A frontend adapter owns surface mechanics and stops them at the adapter boundary.
+
+Adapter input responsibilities:
+
+1. Authenticate the surface request.
+2. Create a `brainapi.Principal` with source-qualified identity and roles.
+3. Create a `brainapi.BindingKey` for the surface location.
+4. Put the user command in `frontend.Request.Text`.
+5. Call `frontend.Dispatcher.Handle`.
+
+Adapter output responsibilities:
+
+1. Convert `frontend.Response.Visibility` to the surface equivalent.
+2. Render `frontend.Response.Text` or `frontend.SafeMessage(err)`.
+3. Map transport-level success/failure without exposing tenant existence.
+
+Current adapters:
+
+| Adapter | Route | Authentication | Binding example | Principal example |
+|---|---|---|---|---|
+| Slack | `POST /slack/commands` | Slack HMAC timestamp signature | `slack:channel:C123` | `Principal{Source:"slack", ID:"U123", Roles:["member", "admin"]}` |
+| Slack interactivity | `POST /slack/interactions` | Slack HMAC timestamp signature | Not dispatched yet; acknowledges receipt | Not dispatched yet |
+| JSON HTTP | `POST /api/commands` | `Authorization: Bearer <API_TOKEN>` | Caller-supplied `binding_key` | Caller-supplied `principal` JSON |
+
+## Source loading
+
+The gateway calls `internal/control/sources.Loader` before core ingestion when `Metadata["content"]` is absent.
+
+Supported input forms:
+
+| Form | Behavior |
+|---|---|
+| `file:///absolute/path.md` | Reads a local file, enforces the byte limit, and infers name/MIME where possible. |
+| `http://...`, `https://...` | Performs a bounded GET with timeout and accepts only 2xx responses. |
+| `text://hello`, `text:hello` | Uses URL-decoded inline text. |
+| `raw://hello`, `raw:hello` | Uses URL-decoded inline text. |
+| Metadata `inline_content`, `inline`, `raw`, or `text` | Uses the metadata value as source content. |
+| Plain or unknown-scheme URI | Treats the URI string as text content. |
+
+The default loader bounds reads to 1 MiB and network loads to 5 seconds.
+
+## Auth and tenant isolation
+
+- Adapter authentication proves the request came from a surface; it does not grant tenant access.
+- Gateway authorization decides whether a `Principal` can perform an `Action` against a tenant or binding.
+- The local `RoleAuthorizer` allows `admin` principals to do everything and allows `member` principals to read/write existing tenants. It requires `admin` for `create_project` and `admin` actions.
+- `ResolveBinding` is the only preflight exception that maps a surface-neutral binding to a tenant ID.
+- `SafeAccessError` hides the difference between missing binding, missing tenant, and unauthorized principal.
+- Job state is always addressed as `(tenant_id, job_id)`.
+- `SetProjectState(off)` freezes serving operations while preserving data.
+
+Production policy should replace or harden `RoleAuthorizer` behind the same gateway seam.
+
+## Persistence
+
+Current committed persistence is local and explicit:
+
+- Without `DATA_PATH`, the memory core and control job ledger are in process memory.
+- With `DATA_PATH`, the server creates the directory and the memory core stores `$DATA_PATH/memory.json` through atomic JSON snapshot writes.
+- The snapshot includes bindings, projects, core jobs, sources, and document content used to rebuild chunks on load.
+- The control-plane job ledger remains in memory; `Status(..., Reconcile:true)` refreshes it from core `JobStatus`.
+
+Roadmap/extension persistence decisions:
+
+- durable control-plane job store
+- durable tenant catalog and binding store beyond the local snapshot
+- dedicated source, chunk, and vector stores
+- backups, migrations, and multi-process concurrency controls
+
+## Operational endpoints
+
+`cmd/workspace-brain` registers endpoints according to configured adapters:
+
+| Endpoint | Method | Mounted when | Purpose |
+|---|---:|---|---|
+| `/healthz` | GET | Always | Liveness. Does not check dependencies. |
+| `/readyz` | GET | Always | Readiness. Checks `DATA_PATH` only when `READINESS_REQUIRED=true`. |
+| `/api/commands` | POST | `API_TOKEN` is set | Token-protected JSON command adapter. |
+| `/slack/commands` | POST | `SLACK_SIGNING_SECRET` is set | Slack slash command adapter. |
+| `/slack/interactions` | POST | `SLACK_SIGNING_SECRET` is set | Slack interactivity acknowledgement endpoint. |
+| `/slack/manifest.json` | GET | `SLACK_SIGNING_SECRET` and HTTPS `PUBLIC_BASE_URL` are set | Deterministic Slack app manifest JSON. |
+
+The process refuses server mode when neither `SLACK_SIGNING_SECRET` nor `API_TOKEN` configures a frontend adapter. The `demo` subcommand bypasses HTTP serving and runs an in-process flow.
+
+## Adding a new frontend adapter
+
+A new adapter should live beside the current control adapters, for example `internal/control/web` or `internal/control/cli`.
+
+Implementation checklist:
+
+1. Accept and authenticate the surface request.
+2. Normalize identity into `brainapi.Principal`.
+3. Normalize location into `brainapi.BindingKey`.
+4. Pass text commands into `frontend.NewDispatcher(gateway).Handle`.
+5. Render `frontend.Response` for the surface.
+6. Add route wiring in `cmd/workspace-brain` or a separate entrypoint.
+7. Test auth failure, malformed input, safe access error rendering, and one successful command path.
+
+Do not add tenant lookup, direct core calls, or surface-specific fields below the adapter boundary.
+
+## Local Data Core
+
+`internal/core/memory` provides the deterministic local RAG path:
+
+1. `CreateProject` stores tenant catalog and binding state atomically.
+2. `Ingest` stores source metadata, chunks text, indexes deterministic local embeddings, and records a running core job.
+3. `Query` combines lexical overlap and vector cosine score, then returns grounded chunks, unique sources, grounded spans, and a synthesized answer.
+4. `Discover` returns metadata only and never exposes chunk text.
+5. `SetProjectState` freezes or re-enables tenant serving.
+6. `WithPersistence` and `NewPersistent` provide optional atomic JSON snapshot persistence.
+
+This local implementation is the development/runtime baseline. PostgreSQL, Qdrant, RabbitMQ, OpenAI, and OpenAI-compatible providers are production adapter seams, not boot prerequisites. The optional OpenAI-compatible client exists in `internal/core/ai`, but the default server path still uses the local memory core with the gateway source loader.
+
+## Roadmap and production extension points
+
+The repository contains seams, not complete SaaS-scale production infrastructure, for:
+
+- secret loading beyond environment variables
+- durable control-plane stores
+- durable source/chunk/vector stores
+- retry/DLQ worker execution for ingest
+- outbound Slack follow-up messages and rich Block Kit rendering
+- full Slack Events API or Workflow handling
+- optional OpenAI/OpenAI-compatible or self-hosted model adapters
+- audit logging, metrics, tracing, backups, and migrations
+- Compose or orchestrator packaging around the committed Dockerfile
+
+See [docs/deployment.md](./docs/deployment.md) for the readiness checklist.
+
+## Verification strategy
+
+Implemented behavior is covered by package tests for:
+
+- contract validation and safe errors
+- gateway authorization, source loading, job lifecycle, and reconciliation
+- frontend dispatch
+- Slack command, interaction, and manifest handling
+- JSON HTTP command handling
+- health/readiness handlers
+- memory core query, discovery, project state, and persistence
+- runtime configuration and HTTP server behavior

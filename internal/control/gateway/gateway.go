@@ -3,10 +3,13 @@ package gateway
 
 import (
 	"context"
-	"fmt"
-	"sync/atomic"
+	"crypto/rand"
+	"encoding/hex"
 
+	"github.com/sangyi/workspace-brain/internal/control/audit"
+	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
+	"github.com/sangyi/workspace-brain/internal/control/sources"
 	"github.com/sangyi/workspace-brain/pkg/brainapi"
 )
 
@@ -40,6 +43,9 @@ type Gateway struct {
 	jobs       *jobs.Store
 	tenantIDs  TenantIDGenerator
 	jobIDs     JobIDGenerator
+	loader     sources.SourceLoader
+	queue      ingest.Queue // optional async completion worker; nil = sync path
+	audit      audit.Logger // defaults to audit.NoOp{}
 }
 
 // Option configures a Gateway.
@@ -63,6 +69,45 @@ func WithJobIDGenerator(gen JobIDGenerator) Option {
 	}
 }
 
+// WithSourceLoader loads source content before core ingestion when Metadata["content"] is absent.
+func WithSourceLoader(loader sources.SourceLoader) Option {
+	return func(g *Gateway) {
+		if loader != nil {
+			g.loader = loader
+		}
+	}
+}
+
+// WithAuditLogger sets the audit logger used to record authorization decisions.
+// Passing nil is a no-op: the default audit.NoOp logger is preserved so that
+// existing behaviour and tests remain unchanged.
+func WithAuditLogger(logger audit.Logger) Option {
+	return func(g *Gateway) {
+		if logger != nil {
+			g.audit = logger
+		}
+	}
+}
+
+// WithQueue wires an async ingest-completion worker to the gateway.
+// When set, Ingest hands a completion task to the queue after synchronously
+// indexing the content; the worker then drives the job to a terminal state.
+// When nil (the default), Ingest stays on the existing synchronous path.
+func WithQueue(q ingest.Queue) Option {
+	return func(g *Gateway) {
+		if q != nil {
+			g.queue = q
+		}
+	}
+}
+
+// SetQueue sets (or replaces) the async ingest-completion queue after
+// construction.  It is provided for lifecycle wiring in the server entrypoint
+// where the gateway and the worker share a mutual reference.
+func (g *Gateway) SetQueue(q ingest.Queue) {
+	g.queue = q
+}
+
 // New creates a Gateway.
 func New(core brainapi.Core, authorizer Authorizer, jobStore *jobs.Store, opts ...Option) (*Gateway, error) {
 	if core == nil {
@@ -78,8 +123,9 @@ func New(core brainapi.Core, authorizer Authorizer, jobStore *jobs.Store, opts .
 		core:       core,
 		authorizer: authorizer,
 		jobs:       jobStore,
-		tenantIDs:  &sequenceTenantIDGenerator{},
-		jobIDs:     &sequenceJobIDGenerator{},
+		tenantIDs:  &randTenantIDGenerator{},
+		jobIDs:     &randJobIDGenerator{},
+		audit:      audit.NoOp{},
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -99,6 +145,23 @@ type CreateProjectResult struct {
 	TenantID brainapi.TenantID
 }
 
+// emitAuthAudit records an authorization decision to the gateway's audit logger.
+func (g *Gateway) emitAuthAudit(actor string, action brainapi.Action, tenantID brainapi.TenantID, authErr error) {
+	decision := audit.DecisionAllow
+	reason := ""
+	if authErr != nil {
+		decision = audit.DecisionDeny
+		reason = authErr.Error()
+	}
+	g.audit.Log(audit.Event{
+		Actor:    actor,
+		Action:   action,
+		TenantID: tenantID,
+		Decision: decision,
+		Reason:   reason,
+	})
+}
+
 // CreateProject authorizes creation, generates tenant_id, and calls core provisioning.
 func (g *Gateway) CreateProject(ctx context.Context, cmd CreateProjectCommand) (CreateProjectResult, error) {
 	const op = "gateway_create_project"
@@ -108,7 +171,9 @@ func (g *Gateway) CreateProject(ctx context.Context, cmd CreateProjectCommand) (
 	if cmd.Principal.ID == "" {
 		return CreateProjectResult{}, brainapi.E(brainapi.KindInvalid, op, "principal is required", nil)
 	}
-	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, BindingKey: cmd.BindingKey, Action: brainapi.ActionCreateProject}); err != nil {
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, BindingKey: cmd.BindingKey, Action: brainapi.ActionCreateProject})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionCreateProject, "", authErr)
+	if authErr != nil {
 		return CreateProjectResult{}, brainapi.SafeAccessError(op)
 	}
 	tenantID := g.tenantIDs.NewTenantID()
@@ -174,7 +239,13 @@ type IngestResult struct {
 	JobID    brainapi.JobID
 }
 
-// Ingest creates the control-plane job before enqueueing core work.
+// Ingest creates the control-plane job, indexes the content synchronously,
+// and — when an async queue is configured — enqueues a lightweight completion
+// task so the job transitions from running to completed in the background.
+//
+// When no queue is configured (the default), the method returns with the job
+// in "running" state, preserving the original behaviour for tests and the demo
+// flow.
 func (g *Gateway) Ingest(ctx context.Context, cmd IngestCommand) (IngestResult, error) {
 	const op = "gateway_ingest"
 	tenantID, err := g.resolveAndAuthorize(ctx, cmd.BindingKey, cmd.Principal, brainapi.ActionIngest, op)
@@ -188,11 +259,34 @@ func (g *Gateway) Ingest(ctx context.Context, cmd IngestCommand) (IngestResult, 
 	if _, err := g.jobs.PutAccepted(tenantID, jobID); err != nil {
 		return IngestResult{}, err
 	}
-	if err := g.core.Ingest(ctx, brainapi.IngestRequest{TenantID: tenantID, JobID: jobID, Source: cmd.Source, Metadata: cloneMap(cmd.Metadata)}); err != nil {
+	source := cmd.Source
+	metadata := cloneMap(cmd.Metadata)
+	if metadata == nil || metadata[sources.MetadataContentKey] == "" {
+		if g.loader != nil {
+			loaded, err := g.loader.Load(ctx, source, metadata)
+			if err != nil {
+				_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
+				return IngestResult{}, err
+			}
+			source = loaded.Source
+			metadata = cloneMap(loaded.Metadata)
+		}
+	}
+	// Index content synchronously so the data is immediately queryable.
+	if err := g.core.Ingest(ctx, brainapi.IngestRequest{TenantID: tenantID, JobID: jobID, Source: source, Metadata: metadata}); err != nil {
 		_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
 		return IngestResult{}, err
 	}
 	_, _ = g.jobs.MarkRunning(tenantID, jobID)
+
+	if g.queue != nil {
+		// Async path: hand off job-state finalization to the completion worker.
+		// The job stays "running" until the worker calls HandleJobCompleted.
+		if err := g.queue.Enqueue(ctx, ingest.Task{TenantID: tenantID, JobID: jobID}); err != nil {
+			_, _ = g.jobs.MarkFailed(tenantID, jobID, err.Error())
+			return IngestResult{}, err
+		}
+	}
 	return IngestResult{TenantID: tenantID, JobID: jobID}, nil
 }
 
@@ -215,6 +309,176 @@ func (g *Gateway) Status(ctx context.Context, cmd StatusCommand) (brainapi.JobSn
 		return g.jobs.Reconcile(ctx, g.core, tenantID, cmd.JobID)
 	}
 	return g.jobs.Snapshot(tenantID, cmd.JobID)
+}
+
+// SetProjectStateCommand asks the gateway to change a tenant lifecycle state.
+type SetProjectStateCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+	State     brainapi.ProjectState
+}
+
+// SetProjectStateResult confirms the updated tenant lifecycle state.
+type SetProjectStateResult struct {
+	TenantID brainapi.TenantID
+	State    brainapi.ProjectState
+}
+
+// SetProjectState authorizes an admin principal and updates core tenant state.
+func (g *Gateway) SetProjectState(ctx context.Context, cmd SetProjectStateCommand) (SetProjectStateResult, error) {
+	const op = "gateway_set_project_state"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return SetProjectStateResult{}, err
+	}
+	if cmd.State != brainapi.ProjectOn && cmd.State != brainapi.ProjectOff {
+		return SetProjectStateResult{}, brainapi.E(brainapi.KindInvalid, op, "unknown project state", nil)
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return SetProjectStateResult{}, brainapi.SafeAccessError(op)
+	}
+	if err := g.core.SetProjectState(ctx, cmd.TenantID, cmd.State); err != nil {
+		if brainapi.IsKind(err, brainapi.KindNotFound) || brainapi.IsKind(err, brainapi.KindUnauthorized) {
+			return SetProjectStateResult{}, brainapi.SafeAccessError(op)
+		}
+		return SetProjectStateResult{}, err
+	}
+	return SetProjectStateResult{TenantID: cmd.TenantID, State: cmd.State}, nil
+}
+
+// AdminListTenantsCommand asks the gateway to enumerate all provisioned tenants.
+type AdminListTenantsCommand struct {
+	Principal brainapi.Principal
+}
+
+// AdminListTenantsResult wraps the core response for the admin surface.
+type AdminListTenantsResult struct {
+	Tenants []brainapi.TenantInfo
+}
+
+// AdminListTenants authorizes an admin principal and returns all tenant summaries.
+func (g *Gateway) AdminListTenants(ctx context.Context, cmd AdminListTenantsCommand) (AdminListTenantsResult, error) {
+	const op = "gateway_admin_list_tenants"
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, "", authErr)
+	if authErr != nil {
+		return AdminListTenantsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+	if err != nil {
+		return AdminListTenantsResult{}, err
+	}
+	return AdminListTenantsResult{Tenants: resp.Tenants}, nil
+}
+
+// AdminListBindingsCommand asks the gateway to enumerate bindings.
+// When TenantID is non-empty only bindings for that tenant are returned.
+type AdminListBindingsCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID // empty = all tenants
+}
+
+// AdminListBindingsResult wraps the core response.
+type AdminListBindingsResult struct {
+	Bindings []brainapi.BindingInfo
+}
+
+// AdminListBindings authorizes an admin principal and returns binding summaries.
+func (g *Gateway) AdminListBindings(ctx context.Context, cmd AdminListBindingsCommand) (AdminListBindingsResult, error) {
+	const op = "gateway_admin_list_bindings"
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListBindingsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListBindings(ctx, brainapi.AdminListBindingsRequest{TenantID: cmd.TenantID})
+	if err != nil {
+		return AdminListBindingsResult{}, err
+	}
+	return AdminListBindingsResult{Bindings: resp.Bindings}, nil
+}
+
+// AdminListSourcesCommand asks for source metadata for a specific tenant.
+type AdminListSourcesCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+}
+
+// AdminListSourcesResult wraps the core response (no chunk content).
+type AdminListSourcesResult struct {
+	Sources []brainapi.SourceInfo
+}
+
+// AdminListSources authorizes and returns source metadata (no chunk content).
+func (g *Gateway) AdminListSources(ctx context.Context, cmd AdminListSourcesCommand) (AdminListSourcesResult, error) {
+	const op = "gateway_admin_list_sources"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return AdminListSourcesResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListSourcesResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListSources(ctx, cmd.TenantID)
+	if err != nil {
+		return AdminListSourcesResult{}, err
+	}
+	return AdminListSourcesResult{Sources: resp.Sources}, nil
+}
+
+// AdminListJobsCommand asks for job snapshots for a specific tenant.
+type AdminListJobsCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+}
+
+// AdminListJobsResult wraps the core response.
+type AdminListJobsResult struct {
+	Jobs []brainapi.JobSnapshot
+}
+
+// AdminListJobs authorizes and returns job snapshots for a tenant.
+func (g *Gateway) AdminListJobs(ctx context.Context, cmd AdminListJobsCommand) (AdminListJobsResult, error) {
+	const op = "gateway_admin_list_jobs"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return AdminListJobsResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return AdminListJobsResult{}, brainapi.SafeAccessError(op)
+	}
+	resp, err := g.core.AdminListJobs(ctx, cmd.TenantID)
+	if err != nil {
+		return AdminListJobsResult{}, err
+	}
+	return AdminListJobsResult{Jobs: resp.Jobs}, nil
+}
+
+// AdminGetJobCommand asks for a single job snapshot.
+type AdminGetJobCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+	JobID     brainapi.JobID
+}
+
+// AdminGetJob authorizes and returns a single job snapshot.
+func (g *Gateway) AdminGetJob(ctx context.Context, cmd AdminGetJobCommand) (brainapi.JobSnapshot, error) {
+	const op = "gateway_admin_get_job"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	if err := brainapi.ValidateJobID(cmd.JobID); err != nil {
+		return brainapi.JobSnapshot{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return brainapi.JobSnapshot{}, brainapi.SafeAccessError(op)
+	}
+	return g.core.AdminGetJob(ctx, cmd.TenantID, cmd.JobID)
 }
 
 // HandleJobCompleted applies a core callback to the control-plane store.
@@ -240,7 +504,9 @@ func (g *Gateway) resolveAndAuthorize(ctx context.Context, binding brainapi.Bind
 		}
 		return "", err
 	}
-	if err := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: principal, TenantID: tenantID, BindingKey: binding, Action: action}); err != nil {
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: principal, TenantID: tenantID, BindingKey: binding, Action: action})
+	g.emitAuthAudit(principal.Key(), action, tenantID, authErr)
+	if authErr != nil {
 		return "", brainapi.SafeAccessError(op)
 	}
 	return tenantID, nil
@@ -257,14 +523,23 @@ func cloneMap(in map[string]string) map[string]string {
 	return out
 }
 
-type sequenceTenantIDGenerator struct{ n atomic.Uint64 }
+// randTenantIDGenerator produces collision-resistant tenant IDs using 128 bits of
+// crypto/rand entropy. Unlike the old sequence-based generator, IDs do not reset
+// to zero on process restart, so they never collide with records in a persistent core.
+type randTenantIDGenerator struct{}
 
-func (g *sequenceTenantIDGenerator) NewTenantID() brainapi.TenantID {
-	return brainapi.TenantID(fmt.Sprintf("tenant-%06d", g.n.Add(1)))
+func (g *randTenantIDGenerator) NewTenantID() brainapi.TenantID {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return brainapi.TenantID("tenant-" + hex.EncodeToString(b[:]))
 }
 
-type sequenceJobIDGenerator struct{ n atomic.Uint64 }
+// randJobIDGenerator produces collision-resistant job IDs using 128 bits of
+// crypto/rand entropy for the same restart-safety reason as randTenantIDGenerator.
+type randJobIDGenerator struct{}
 
-func (g *sequenceJobIDGenerator) NewJobID() brainapi.JobID {
-	return brainapi.JobID(fmt.Sprintf("job-%06d", g.n.Add(1)))
+func (g *randJobIDGenerator) NewJobID() brainapi.JobID {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return brainapi.JobID("job-" + hex.EncodeToString(b[:]))
 }
