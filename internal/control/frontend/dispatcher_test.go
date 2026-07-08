@@ -44,6 +44,59 @@ func TestDispatcherUsesSurfaceNeutralEnvelope(t *testing.T) {
 	}
 }
 
+// TestDispatcherAskExposesProvenance verifies that grounded citations and the
+// GroundingAvailable flag survive the trip from the gateway answer to the
+// surface-neutral envelope, and that ungrounded ("모른다") answers carry no
+// provenance.
+func TestDispatcherAskExposesProvenance(t *testing.T) {
+	t.Parallel()
+	sources := []brainapi.Source{
+		{ID: "s1", Title: "Doc One", URI: "https://example.com/doc1", TenantID: "tenant-1"},
+		{ID: "s2", Title: "Doc Two", URI: "https://example.com/doc2", TenantID: "tenant-1"},
+	}
+	gw := &fakeGateway{answer: "grounded answer", sources: sources, groundingAvailable: true}
+	d := NewDispatcher(gw)
+	req := Request{BindingKey: "web:space:S1", Principal: brainapi.Principal{Source: "web", ID: "user-1"}}
+
+	res, err := d.Handle(context.Background(), withText(req, "ask what changed?"))
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if !res.GroundingAvailable {
+		t.Fatalf("expected GroundingAvailable=true, got %+v", res)
+	}
+	if len(res.Sources) != 2 || res.Sources[0].Title != "Doc One" {
+		t.Fatalf("sources = %+v", res.Sources)
+	}
+
+	ungrounded := &fakeGateway{answer: "수집된 근거가 없습니다: q", groundingAvailable: false}
+	res, err = NewDispatcher(ungrounded).Handle(context.Background(), withText(req, "ask unknown?"))
+	if err != nil {
+		t.Fatalf("ask ungrounded: %v", err)
+	}
+	if res.GroundingAvailable || len(res.Sources) != 0 {
+		t.Fatalf("expected no provenance for ungrounded answer, got %+v", res)
+	}
+}
+
+// TestFormatCitations exercises every statement in FormatCitations: the
+// empty-sources short circuit, the title-fallback-to-URI assignment, and the
+// URI-suffix branch.
+func TestFormatCitations(t *testing.T) {
+	t.Parallel()
+	if got := FormatCitations(nil); got != "" {
+		t.Fatalf("empty sources = %q", got)
+	}
+	got := FormatCitations([]brainapi.Source{
+		{Title: "Doc One", URI: "https://example.com/doc1"},
+		{URI: "https://example.com/doc2"},
+	})
+	want := "\n\n출처:\n1. Doc One (https://example.com/doc1)\n2. https://example.com/doc2"
+	if got != want {
+		t.Fatalf("format = %q, want %q", got, want)
+	}
+}
+
 func TestDispatcherCreateAndDiscover(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{}
@@ -244,21 +297,104 @@ func TestDispatcherAdminListGatewayErrors(t *testing.T) {
 	}
 }
 
+// TestDispatcherAdminShared covers the `admin shared create|bind|promote`
+// surface added for issue #12's shared knowledge tenant mechanism: success
+// paths that reach the gateway, and every validation-error branch.
+func TestDispatcherAdminShared(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	d := NewDispatcher(gw)
+	admin := brainapi.Principal{Source: "api", ID: "admin", Roles: []string{"admin"}}
+
+	res, err := d.Handle(context.Background(), withText(Request{Principal: admin}, "admin shared create shared-1"))
+	if err != nil {
+		t.Fatalf("shared create: %v", err)
+	}
+	if !strings.Contains(res.Text, "shared-1") || gw.createdShared.TenantID != "shared-1" {
+		t.Fatalf("response=%+v command=%+v", res, gw.createdShared)
+	}
+
+	res, err = d.Handle(context.Background(), withText(Request{Principal: admin}, "admin shared bind project-1 shared-1"))
+	if err != nil {
+		t.Fatalf("shared bind: %v", err)
+	}
+	if !strings.Contains(res.Text, "project-1->shared-1") || gw.boundShared.ProjectTenantID != "project-1" || gw.boundShared.SharedTenantID != "shared-1" {
+		t.Fatalf("response=%+v command=%+v", res, gw.boundShared)
+	}
+
+	res, err = d.Handle(context.Background(), withText(Request{Principal: admin}, "admin shared promote project-1 shared-1 source-1"))
+	if err != nil {
+		t.Fatalf("shared promote: %v", err)
+	}
+	if !strings.Contains(res.Text, "source-1") || gw.promoted.ProjectTenantID != "project-1" || gw.promoted.SharedTenantID != "shared-1" || gw.promoted.SourceID != "source-1" {
+		t.Fatalf("response=%+v command=%+v", res, gw.promoted)
+	}
+
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{"shared no sub", "admin shared"},
+		{"shared unknown sub", "admin shared blah"},
+		{"shared create missing tenant", "admin shared create"},
+		{"shared bind missing args", "admin shared bind project-1"},
+		{"shared promote missing args", "admin shared promote project-1 shared-1"},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := d.Handle(context.Background(), withText(Request{Principal: admin}, tt.text))
+			if !brainapi.IsKind(err, brainapi.KindInvalid) {
+				t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+			}
+		})
+	}
+}
+
+// TestDispatcherAdminSharedGatewayErrors verifies that gateway errors from the
+// shared-tenant admin methods are propagated to the caller.
+func TestDispatcherAdminSharedGatewayErrors(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("gateway down")
+	d := NewDispatcher(&fakeGateway{err: boom})
+	admin := brainapi.Principal{Source: "api", ID: "admin", Roles: []string{"admin"}}
+	for _, text := range []string{
+		"admin shared create shared-1",
+		"admin shared bind project-1 shared-1",
+		"admin shared promote project-1 shared-1 source-1",
+	} {
+		text := text
+		t.Run(text, func(t *testing.T) {
+			t.Parallel()
+			_, err := d.Handle(context.Background(), withText(Request{Principal: admin}, text))
+			if err == nil || err.Error() != "gateway down" {
+				t.Fatalf("err=%v", err)
+			}
+		})
+	}
+}
+
 func withText(req Request, text string) Request {
 	req.Text = text
 	return req
 }
 
 type fakeGateway struct {
-	created      gateway.CreateProjectCommand
-	asked        gateway.AskCommand
-	discovered   gateway.DiscoverCommand
-	ingested     gateway.IngestCommand
-	status       gateway.StatusCommand
-	projectState gateway.SetProjectStateCommand
-	answer       string
-	jobStatus    brainapi.JobStatus
-	err          error
+	created            gateway.CreateProjectCommand
+	asked              gateway.AskCommand
+	discovered         gateway.DiscoverCommand
+	ingested           gateway.IngestCommand
+	status             gateway.StatusCommand
+	projectState       gateway.SetProjectStateCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	jobStatus          brainapi.JobStatus
+	err                error
+	// shared knowledge tenant admin surface (issue #12)
+	createdShared gateway.CreateSharedTenantCommand
+	boundShared   gateway.BindSharedTenantCommand
+	promoted      gateway.PromoteToSharedCommand
 }
 
 func (f *fakeGateway) CreateProject(_ context.Context, cmd gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
@@ -278,7 +414,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if answer == "" {
 		answer = "ok"
 	}
-	return brainapi.QueryResponse{Answer: answer}, nil
+	return brainapi.QueryResponse{Answer: answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(_ context.Context, cmd gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {
@@ -350,6 +486,30 @@ func (f *fakeGateway) AdminGetJob(_ context.Context, _ gateway.AdminGetJobComman
 		return brainapi.JobSnapshot{}, f.err
 	}
 	return brainapi.JobSnapshot{TenantID: "t1", JobID: "job-1", Status: brainapi.JobCompleted}, nil
+}
+
+func (f *fakeGateway) CreateSharedTenant(_ context.Context, cmd gateway.CreateSharedTenantCommand) (gateway.CreateSharedTenantResult, error) {
+	f.createdShared = cmd
+	if f.err != nil {
+		return gateway.CreateSharedTenantResult{}, f.err
+	}
+	return gateway.CreateSharedTenantResult{TenantID: cmd.TenantID}, nil
+}
+
+func (f *fakeGateway) BindSharedTenant(_ context.Context, cmd gateway.BindSharedTenantCommand) (gateway.BindSharedTenantResult, error) {
+	f.boundShared = cmd
+	if f.err != nil {
+		return gateway.BindSharedTenantResult{}, f.err
+	}
+	return gateway.BindSharedTenantResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID}, nil
+}
+
+func (f *fakeGateway) PromoteToShared(_ context.Context, cmd gateway.PromoteToSharedCommand) (gateway.PromoteToSharedResult, error) {
+	f.promoted = cmd
+	if f.err != nil {
+		return gateway.PromoteToSharedResult{}, f.err
+	}
+	return gateway.PromoteToSharedResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID, SourceID: cmd.SourceID}, nil
 }
 
 type userOnlyGateway struct{ base *fakeGateway }

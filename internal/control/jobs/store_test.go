@@ -176,6 +176,71 @@ func TestStoreValidationBranches(t *testing.T) {
 	}
 }
 
+func TestStoreReconcileNotFoundFallback(t *testing.T) {
+	t.Parallel()
+	notFound := statusReaderFunc(func(context.Context, brainapi.TenantID, brainapi.JobID) (brainapi.JobSnapshot, error) {
+		return brainapi.JobSnapshot{}, brainapi.E(brainapi.KindNotFound, "job_status", "job not found", nil)
+	})
+
+	t.Run("no local snapshot creates check-required", func(t *testing.T) {
+		t.Parallel()
+		store := NewStore()
+		snapshot, err := store.Reconcile(context.Background(), notFound, "tenant-a", "job-new")
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if snapshot.Status != brainapi.JobCheckRequired || snapshot.Error == "" {
+			t.Fatalf("snapshot = %+v, want check_required with a message", snapshot)
+		}
+		// The fallback snapshot must actually be persisted so a subsequent
+		// Snapshot() call observes the same check-required state.
+		stored, err := store.Snapshot("tenant-a", "job-new")
+		if err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+		if stored.Status != brainapi.JobCheckRequired {
+			t.Fatalf("stored = %+v, want check_required", stored)
+		}
+	})
+
+	t.Run("non-final local snapshot is marked check-required", func(t *testing.T) {
+		t.Parallel()
+		store := NewStore()
+		if _, err := store.PutAccepted("tenant-a", "job-running"); err != nil {
+			t.Fatalf("PutAccepted: %v", err)
+		}
+		if _, err := store.MarkRunning("tenant-a", "job-running"); err != nil {
+			t.Fatalf("MarkRunning: %v", err)
+		}
+		snapshot, err := store.Reconcile(context.Background(), notFound, "tenant-a", "job-running")
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if snapshot.Status != brainapi.JobCheckRequired || snapshot.Error == "" {
+			t.Fatalf("snapshot = %+v, want check_required with a message", snapshot)
+		}
+	})
+
+	t.Run("final local snapshot is preserved unchanged", func(t *testing.T) {
+		t.Parallel()
+		store := NewStore()
+		if _, err := store.PutAccepted("tenant-a", "job-done"); err != nil {
+			t.Fatalf("PutAccepted: %v", err)
+		}
+		completed, err := store.MarkCompleted("tenant-a", "job-done", "bronze://result")
+		if err != nil {
+			t.Fatalf("MarkCompleted: %v", err)
+		}
+		snapshot, err := store.Reconcile(context.Background(), notFound, "tenant-a", "job-done")
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		if snapshot != completed {
+			t.Fatalf("snapshot = %+v, want unchanged final snapshot %+v", snapshot, completed)
+		}
+	})
+}
+
 func TestStoreRemainingReconcileAndSetErrors(t *testing.T) {
 	t.Parallel()
 	store := NewStore()

@@ -11,6 +11,47 @@ The project requires 100% statement coverage for committed Go code.
 - Do not lower coverage to merge incomplete behavior.
 - Keep tests deterministic. Avoid external network, Slack, OpenAI, PostgreSQL, Qdrant, or RabbitMQ dependencies in the default suite.
 
+### Integration-only package exclusion
+
+`scripts/check-coverage.sh` excludes four packages from the 100% statement-coverage
+total. This is a deliberate policy, not a loophole:
+
+| Package | Why it is excluded |
+|---|---|
+| `internal/core/coretest` | Test-helper package only (contract-suite assertions for other packages to import). Its `t.Fatalf` guard lines are never hit on a passing run — that is inherent to assertion helpers, not missing coverage. |
+| `internal/core/postgres` | Adapter with `//go:build integration` tests only. Zero default-build tests by design; see below. |
+| `internal/core/qdrant` | Adapter with `//go:build integration` tests only. Zero default-build tests by design; see below. |
+| `internal/control/rabbitmq` | Adapter with `//go:build integration` tests only. Zero default-build tests by design; see below. |
+
+The three adapter packages carry `//go:build integration` on every test file, so
+`go test ./...` (the default suite) compiles their production code but runs zero
+tests against it — there is nothing to include in the default coverage profile
+in the first place. The gate stays meaningful for the packages it does cover
+(deterministic core, control-plane, adapters with default-build tests) by
+excluding packages that have no default-build tests, rather than diluting the
+100% target with untested-by-design production code.
+
+These packages are not untested — they are covered under the `integration`
+build tag, exercised via [testcontainers-go](https://golang.testcontainers.org/)
+against real Postgres/Qdrant/RabbitMQ containers. Their real, integration-tag
+coverage is tracked informationally in comments in `scripts/check-coverage.sh`
+(not enforced as a gate): postgres 74.1%, qdrant 98.8%, rabbitmq 65.0% (as of
+2026-07-08). Re-verify these numbers with `make test-integration` (see below)
+whenever you touch adapter tests, and update the comment if it has drifted —
+drift does not fail CI, but a stale number is misleading to the next reader.
+
+### Running integration tests locally
+
+```bash
+make test-integration
+```
+
+This runs `go test -tags=integration -race` against the three adapter
+packages. Each test starts its own ephemeral Postgres/Qdrant/RabbitMQ
+container via testcontainers-go and tears it down afterward — no manual
+`docker compose up` or fixture setup is required, only a working Docker
+daemon.
+
 ## Required local commands
 
 Run these commands from the repository root:
@@ -46,19 +87,28 @@ make docker-build
 
 CI must fail when any required gate fails.
 
-Required checks:
+Required checks (`test` job in `.github/workflows/ci.yml`):
 
 | Check | Purpose |
 |---|---|
-| `go test ./...` | Unit and integration behavior across packages. |
+| `go test ./...` | Unit and integration behavior across packages (default build; deterministic core only). |
 | `go test -race ./...` | Race safety for memory core, job store, server shutdown, and adapters. |
 | `go test -coverprofile=coverage.out ./...` | Generate coverage data. |
-| `./scripts/check-coverage.sh coverage.out` | Enforce 100% coverage. |
+| `./scripts/check-coverage.sh coverage.out` | Enforce 100% coverage on packages that have default-build tests (see exclusion policy above). |
 | `go vet ./...` | Catch suspicious Go constructs. |
 | `govulncheck ./...` | Detect known vulnerabilities in reachable code. |
 | `docker build -t workspace-brain:local .` | Verify the committed Dockerfile builds. |
 
-CI should use the local deterministic core by default. External provider or database adapters need separate opt-in jobs with explicit credentials and fixtures.
+CI uses the local deterministic core by default in the `test` job. Adapters
+with a real backing service (Postgres, Qdrant, RabbitMQ) are exercised in a
+separate `integration-test` job, gated behind `-tags=integration`. Unlike
+external SaaS providers (Slack, OpenAI), these adapters need no external
+credentials or fixtures: their tests provision their own ephemeral containers
+via testcontainers-go, so the `integration-test` job only needs a working
+Docker daemon (present by default on `ubuntu-latest` runners) — see
+`make test-integration` above. Providers that genuinely require external
+credentials (Slack, OpenAI) remain out of the default CI path and are not
+covered by an automated job here.
 
 ## Smoke test expectations
 

@@ -63,6 +63,38 @@ func TestHandlerAskReturnsEphemeralAnswer(t *testing.T) {
 	assertTextContains(t, rec.Body.String(), "근거 기반 답변")
 }
 
+func TestHandlerAskRendersCitationsWhenGrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{
+		answer:             "근거 기반 답변",
+		sources:            []brainapi.Source{{Title: "Doc One", URI: "https://example.com/doc1"}},
+		groundingAvailable: true,
+	}
+	h := NewHandler(gw, "secret", nil)
+	h.Now = fixedNow
+	rec := perform(t, h, "ask 질문")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertTextContains(t, rec.Body.String(), "근거 기반 답변")
+	assertTextContains(t, rec.Body.String(), "출처:")
+	assertTextContains(t, rec.Body.String(), "Doc One (https://example.com/doc1)")
+}
+
+func TestHandlerAskOmitsCitationsWhenUngrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{answer: "수집된 근거가 없습니다: 질문", groundingAvailable: false}
+	h := NewHandler(gw, "secret", nil)
+	h.Now = fixedNow
+	rec := perform(t, h, "ask 질문")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "출처:") {
+		t.Fatalf("expected no citation list for ungrounded answer, body=%s", rec.Body.String())
+	}
+}
+
 func TestHandlerIngestAndStatus(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{jobStatus: brainapi.JobCompleted}
@@ -157,18 +189,22 @@ func assertTextContains(t *testing.T, body, want string) {
 }
 
 type fakeGateway struct {
-	created    gateway.CreateProjectCommand
-	asked      gateway.AskCommand
-	discovered gateway.DiscoverCommand
-	ingested   gateway.IngestCommand
-	status     gateway.StatusCommand
-	answer     string
-	jobStatus  brainapi.JobStatus
-	err        error
+	created            gateway.CreateProjectCommand
+	createCalls        int
+	asked              gateway.AskCommand
+	discovered         gateway.DiscoverCommand
+	ingested           gateway.IngestCommand
+	status             gateway.StatusCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	jobStatus          brainapi.JobStatus
+	err                error
 }
 
 func (f *fakeGateway) CreateProject(_ context.Context, cmd gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
 	f.created = cmd
+	f.createCalls++
 	if f.err != nil {
 		return gateway.CreateProjectResult{}, f.err
 	}
@@ -184,7 +220,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if answer == "" {
 		answer = "ok"
 	}
-	return brainapi.QueryResponse{Answer: answer}, nil
+	return brainapi.QueryResponse{Answer: answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(_ context.Context, cmd gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {
@@ -364,6 +400,15 @@ func TestRenderMapsVisibilityToSlackResponseType(t *testing.T) {
 	if got.ResponseType != "in_channel" || got.Text != "broadcast" {
 		t.Fatalf("default (empty visibility): %+v", got)
 	}
+
+	got = render(frontend.Response{
+		Visibility: frontend.VisibilityPrivate,
+		Text:       "grounded",
+		Sources:    []brainapi.Source{{Title: "Doc", URI: "https://example.com/d"}},
+	})
+	if got.Text != "grounded"+frontend.FormatCitations([]brainapi.Source{{Title: "Doc", URI: "https://example.com/d"}}) {
+		t.Fatalf("with sources: %+v", got)
+	}
 }
 
 func signWithTimestamp(body, ts string) string {
@@ -414,3 +459,250 @@ func TestHandlerBodyReadAndParseErrors(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("read") }
+
+// interactionBody form-encodes a Slack interactivity JSON payload under the
+// "payload" field, as Slack itself does when delivering block_actions.
+func interactionBody(t *testing.T, payload interactionPayload) string {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return url.Values{"payload": {string(raw)}}.Encode()
+}
+
+func signedInteractionRequest(body string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Slack-Request-Timestamp", timestamp())
+	req.Header.Set("X-Slack-Signature", sign(body))
+	return req
+}
+
+func TestHandlerServeInteractionDispatchesShareResponseAction(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	payload := interactionPayload{
+		Type:      "block_actions",
+		TriggerID: "trigger-share-1",
+		Actions:   []interactionAction{{ActionID: actionShareResponse, Value: "공유된 답변"}},
+	}
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(interactionBody(t, payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp slackResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ResponseType != "in_channel" || resp.Text != "공유된 답변" {
+		t.Fatalf("resp = %+v", resp)
+	}
+}
+
+func TestHandlerServeInteractionDispatchesConfirmCommandAction(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "secret", map[string]bool{"U-admin": true})
+	h.Now = fixedNow
+	payload := interactionPayload{
+		Type:      "block_actions",
+		TriggerID: "trigger-confirm-1",
+		User: struct {
+			ID string `json:"id"`
+		}{ID: "U-admin"},
+		Channel: struct {
+			ID string `json:"id"`
+		}{ID: "C1"},
+		Actions: []interactionAction{{ActionID: actionConfirmCommand, Value: "create Demo"}},
+	}
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(interactionBody(t, payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gw.created.BindingKey != "slack:channel:C1" || !gw.created.Principal.HasRole("admin") || gw.created.Metadata["name"] != "Demo" {
+		t.Fatalf("created command = %+v", gw.created)
+	}
+}
+
+func TestHandlerServeInteractionActionDispatchErrorRendersSafeMessage(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{err: errors.New("gateway exploded")}
+	h := NewHandler(gw, "secret", nil)
+	h.Now = fixedNow
+	payload := interactionPayload{
+		Type:      "block_actions",
+		TriggerID: "trigger-confirm-err",
+		Actions:   []interactionAction{{ActionID: actionConfirmCommand, Value: "create Demo"}},
+	}
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(interactionBody(t, payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertTextContains(t, rec.Body.String(), "gateway exploded")
+}
+
+func TestHandlerServeInteractionUnsupportedTypeIsAcknowledgedGenerically(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	payload := interactionPayload{
+		Type:      "view_submission",
+		TriggerID: "trigger-view-1",
+		Actions:   []interactionAction{{ActionID: actionShareResponse, Value: "무시됨"}},
+	}
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(interactionBody(t, payload)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	assertTextContains(t, rec.Body.String(), "상호작용 요청이 접수되었습니다")
+}
+
+func TestHandlerServeInteractionInvalidPayloadJSON(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	body := url.Values{"payload": {"not-json"}}.Encode()
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerServeInteractionMalformedFormBody(t *testing.T) {
+	t.Parallel()
+	h := NewHandler(&fakeGateway{}, "secret", nil)
+	h.Now = fixedNow
+	body := "payload=%zz"
+	rec := httptest.NewRecorder()
+	h.ServeInteraction(rec, signedInteractionRequest(body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlerServeInteractionDedupSkipsDuplicateDelivery(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "secret", map[string]bool{"U-admin": true})
+	h.Now = fixedNow
+	payload := interactionPayload{
+		Type:      "block_actions",
+		TriggerID: "trigger-dedup-1",
+		Channel: struct {
+			ID string `json:"id"`
+		}{ID: "C1"},
+		User: struct {
+			ID string `json:"id"`
+		}{ID: "U-admin"},
+		Actions: []interactionAction{{ActionID: actionConfirmCommand, Value: "create Demo"}},
+	}
+	body := interactionBody(t, payload)
+
+	first := httptest.NewRecorder()
+	h.ServeInteraction(first, signedInteractionRequest(body))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	if gw.createCalls != 1 {
+		t.Fatalf("createCalls after first delivery = %d, want 1", gw.createCalls)
+	}
+
+	second := httptest.NewRecorder()
+	h.ServeInteraction(second, signedInteractionRequest(body))
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", second.Code, second.Body.String())
+	}
+	if gw.createCalls != 1 {
+		t.Fatalf("createCalls after duplicate delivery = %d, want still 1 (no double side effect)", gw.createCalls)
+	}
+	assertTextContains(t, second.Body.String(), "이미 처리된 요청입니다")
+
+	retryReq := signedInteractionRequest(body)
+	retryReq.Header.Set("X-Slack-Retry-Num", "1")
+	third := httptest.NewRecorder()
+	h.ServeInteraction(third, retryReq)
+	if gw.createCalls != 1 {
+		t.Fatalf("createCalls after retried duplicate delivery = %d, want still 1", gw.createCalls)
+	}
+	assertTextContains(t, third.Body.String(), "Slack 재시도 요청이 감지되어 중복 처리를 건너뛰었습니다")
+}
+
+func TestHandlerServeHTTPDedupSkipsDuplicateSlashCommand(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "secret", map[string]bool{"U-admin": true})
+	h.Now = fixedNow
+	body := url.Values{"command": {"/brain"}, "channel_id": {"C1"}, "user_id": {"U-admin"}, "trigger_id": {"trigger-slash-1"}, "text": {"create Demo"}}.Encode()
+
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, signedRequest(body))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	if gw.createCalls != 1 {
+		t.Fatalf("createCalls after first request = %d, want 1", gw.createCalls)
+	}
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, signedRequest(body))
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status=%d body=%s", second.Code, second.Body.String())
+	}
+	if gw.createCalls != 1 {
+		t.Fatalf("createCalls after duplicate request = %d, want still 1", gw.createCalls)
+	}
+	assertTextContains(t, second.Body.String(), "이미 처리된 요청입니다")
+}
+
+func TestIsSlackRetry(t *testing.T) {
+	t.Parallel()
+	withRetry := httptest.NewRequest(http.MethodPost, "/slack", nil)
+	withRetry.Header.Set("X-Slack-Retry-Num", "1")
+	if !isSlackRetry(withRetry) {
+		t.Fatal("expected retry request to be detected")
+	}
+
+	withoutRetry := httptest.NewRequest(http.MethodPost, "/slack", nil)
+	if isSlackRetry(withoutRetry) {
+		t.Fatal("expected non-retry request to not be detected as retry")
+	}
+}
+
+func TestDuplicateMessage(t *testing.T) {
+	t.Parallel()
+	retryReq := httptest.NewRequest(http.MethodPost, "/slack", nil)
+	retryReq.Header.Set("X-Slack-Retry-Num", "1")
+	if got := duplicateMessage(retryReq); got != "Slack 재시도 요청이 감지되어 중복 처리를 건너뛰었습니다." {
+		t.Fatalf("duplicateMessage(retry) = %q", got)
+	}
+
+	plainReq := httptest.NewRequest(http.MethodPost, "/slack", nil)
+	if got := duplicateMessage(plainReq); got != "이미 처리된 요청입니다." {
+		t.Fatalf("duplicateMessage(plain) = %q", got)
+	}
+}
+
+func TestDedupKeyFromBody(t *testing.T) {
+	t.Parallel()
+	if got := dedupKeyFromBody("trigger-1", []byte("ignored when trigger present")); got != "trigger:trigger-1" {
+		t.Fatalf("dedupKeyFromBody with trigger = %q", got)
+	}
+	got1 := dedupKeyFromBody("", []byte("same body"))
+	got2 := dedupKeyFromBody("", []byte("same body"))
+	if got1 != got2 {
+		t.Fatalf("dedupKeyFromBody fallback must be deterministic: %q != %q", got1, got2)
+	}
+	if !strings.HasPrefix(got1, "body:") {
+		t.Fatalf("dedupKeyFromBody fallback = %q, want body: prefix", got1)
+	}
+	if got3 := dedupKeyFromBody("", []byte("different body")); got3 == got1 {
+		t.Fatalf("dedupKeyFromBody fallback must differ for different bodies")
+	}
+}

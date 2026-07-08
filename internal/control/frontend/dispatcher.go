@@ -27,6 +27,12 @@ type AdminGateway interface {
 	AdminListSources(ctx context.Context, cmd gateway.AdminListSourcesCommand) (gateway.AdminListSourcesResult, error)
 	AdminListJobs(ctx context.Context, cmd gateway.AdminListJobsCommand) (gateway.AdminListJobsResult, error)
 	AdminGetJob(ctx context.Context, cmd gateway.AdminGetJobCommand) (brainapi.JobSnapshot, error)
+	// Shared knowledge tenant admin surface (issue #12). See
+	// gateway.Gateway.CreateSharedTenant/BindSharedTenant/PromoteToShared for
+	// the authorization contract each method enforces.
+	CreateSharedTenant(ctx context.Context, cmd gateway.CreateSharedTenantCommand) (gateway.CreateSharedTenantResult, error)
+	BindSharedTenant(ctx context.Context, cmd gateway.BindSharedTenantCommand) (gateway.BindSharedTenantResult, error)
+	PromoteToShared(ctx context.Context, cmd gateway.PromoteToSharedCommand) (gateway.PromoteToSharedResult, error)
 }
 
 // Visibility tells a frontend adapter how broadly a response should be shown.
@@ -48,6 +54,13 @@ type Request struct {
 type Response struct {
 	Visibility Visibility
 	Text       string
+	// Sources lists the grounded citations backing Text. It is populated only
+	// for "ask" responses that found grounded evidence; it is empty for every
+	// other command and for ungrounded ("모른다") answers.
+	Sources []brainapi.Source
+	// GroundingAvailable reports whether the underlying query found grounded
+	// evidence. Adapters must not render a citation list when this is false.
+	GroundingAvailable bool
 }
 
 // Dispatcher routes normalized frontend commands to gateway methods.
@@ -95,7 +108,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req Request) (Response, error) 
 		if err != nil {
 			return Response{}, err
 		}
-		return private(answer.Answer), nil
+		res := private(answer.Answer)
+		res.Sources = answer.Sources
+		res.GroundingAvailable = answer.GroundingAvailable
+		return res, nil
 	case "discover":
 		result, err := d.gateway.Discover(ctx, gateway.DiscoverCommand{BindingKey: req.BindingKey, Principal: req.Principal, Query: args})
 		if err != nil {
@@ -130,7 +146,7 @@ func (d *Dispatcher) Handle(ctx context.Context, req Request) (Response, error) 
 func (d *Dispatcher) handleAdmin(ctx context.Context, principal brainapi.Principal, args string) (Response, error) {
 	fields := strings.Fields(args)
 	if len(fields) == 0 {
-		return Response{}, brainapi.E(brainapi.KindInvalid, "frontend_admin", "admin 명령은 `admin on|off <tenant>`, `admin list tenants|bindings|sources <tenant>|jobs <tenant>`, `admin get job <tenant> <jobID>` 형식이어야 합니다.", nil)
+		return Response{}, brainapi.E(brainapi.KindInvalid, "frontend_admin", "admin 명령은 `admin on|off <tenant>`, `admin list tenants|bindings|sources <tenant>|jobs <tenant>`, `admin get job <tenant> <jobID>`, `admin shared create|bind|promote ...` 형식이어야 합니다.", nil)
 	}
 	if d.admin == nil {
 		return Response{}, brainapi.E(brainapi.KindInvalid, "frontend_admin", "admin capability is not configured", nil)
@@ -150,8 +166,53 @@ func (d *Dispatcher) handleAdmin(ctx context.Context, principal brainapi.Princip
 		return d.handleAdminList(ctx, principal, fields[1:])
 	case "get":
 		return d.handleAdminGet(ctx, principal, fields[1:])
+	case "shared":
+		return d.handleAdminShared(ctx, principal, fields[1:])
 	default:
 		return Response{}, brainapi.E(brainapi.KindInvalid, "frontend_admin", "알 수 없는 admin 서브커맨드입니다.", nil)
+	}
+}
+
+// handleAdminShared implements the minimal admin surface for issue #12's
+// shared knowledge tenant mechanism: `admin shared create|bind|promote ...`.
+// It performs no authorization itself — every branch calls straight through
+// to the corresponding gateway method, which enforces
+// brainapi.ActionAdmin/brainapi.ActionPromoteToShared before touching core.
+func (d *Dispatcher) handleAdminShared(ctx context.Context, principal brainapi.Principal, args []string) (Response, error) {
+	const op = "frontend_admin_shared"
+	if len(args) == 0 {
+		return Response{}, brainapi.E(brainapi.KindInvalid, op, "admin shared 명령은 `admin shared create <tenant_id>`, `admin shared bind <project_tenant> <shared_tenant>`, `admin shared promote <project_tenant> <shared_tenant> <source_id>` 형식이어야 합니다.", nil)
+	}
+	switch strings.ToLower(args[0]) {
+	case "create":
+		if len(args) < 2 {
+			return Response{}, brainapi.E(brainapi.KindInvalid, op, "admin shared create 명령은 `admin shared create <tenant_id>` 형식이어야 합니다.", nil)
+		}
+		result, err := d.admin.CreateSharedTenant(ctx, gateway.CreateSharedTenantCommand{Principal: principal, TenantID: brainapi.TenantID(args[1])})
+		if err != nil {
+			return Response{}, err
+		}
+		return private("공유 테넌트가 생성되었습니다: " + string(result.TenantID)), nil
+	case "bind":
+		if len(args) < 3 {
+			return Response{}, brainapi.E(brainapi.KindInvalid, op, "admin shared bind 명령은 `admin shared bind <project_tenant> <shared_tenant>` 형식이어야 합니다.", nil)
+		}
+		result, err := d.admin.BindSharedTenant(ctx, gateway.BindSharedTenantCommand{Principal: principal, ProjectTenantID: brainapi.TenantID(args[1]), SharedTenantID: brainapi.TenantID(args[2])})
+		if err != nil {
+			return Response{}, err
+		}
+		return private("공유 테넌트가 바인딩되었습니다: " + string(result.ProjectTenantID) + "->" + string(result.SharedTenantID)), nil
+	case "promote":
+		if len(args) < 4 {
+			return Response{}, brainapi.E(brainapi.KindInvalid, op, "admin shared promote 명령은 `admin shared promote <project_tenant> <shared_tenant> <source_id>` 형식이어야 합니다.", nil)
+		}
+		result, err := d.admin.PromoteToShared(ctx, gateway.PromoteToSharedCommand{Admin: principal, ProjectTenantID: brainapi.TenantID(args[1]), SharedTenantID: brainapi.TenantID(args[2]), SourceID: args[3]})
+		if err != nil {
+			return Response{}, err
+		}
+		return private("소스가 승격되었습니다: " + result.SourceID), nil
+	default:
+		return Response{}, brainapi.E(brainapi.KindInvalid, op, "알 수 없는 admin shared 대상입니다.", nil)
 	}
 }
 
@@ -228,4 +289,32 @@ func SafeMessage(err error) string {
 
 func private(text string) Response {
 	return Response{Visibility: VisibilityPrivate, Text: text}
+}
+
+// FormatCitations renders a numbered citation list suitable for appending
+// after an answer's text. It returns an empty string when there are no
+// sources to cite, so callers can safely append the result unconditionally
+// (e.g. ungrounded "모른다" answers are left untouched).
+func FormatCitations(sources []brainapi.Source) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n출처:")
+	for i, s := range sources {
+		label := s.Title
+		if label == "" {
+			label = s.URI
+		}
+		b.WriteString("\n")
+		b.WriteString(strconv.Itoa(i + 1))
+		b.WriteString(". ")
+		b.WriteString(label)
+		if s.URI != "" && s.URI != label {
+			b.WriteString(" (")
+			b.WriteString(s.URI)
+			b.WriteString(")")
+		}
+	}
+	return b.String()
 }

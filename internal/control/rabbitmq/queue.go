@@ -218,7 +218,7 @@ func (q *Queue) handleDelivery(d amqp.Delivery) {
 		return
 	}
 	if err := q.processTask(task); err != nil {
-		q.retryOrDLQ(d, err)
+		q.retryOrDLQ(d, task, err)
 		return
 	}
 	_ = d.Ack(false)
@@ -237,11 +237,19 @@ func (q *Queue) processTask(task ingest.Task) error {
 // retryOrDLQ republishes the message with an incremented retry counter after
 // exponential back-off, or nacks it to the DLQ when retries are exhausted.
 // Back-off delays: 500ms, 1s, 2s (for retry counts 0, 1, 2).
-func (q *Queue) retryOrDLQ(d amqp.Delivery, processErr error) {
+//
+// task carries the job/tenant identifiers recovered from the successfully
+// unmarshaled delivery body; it is used to (a) enrich log lines so failures
+// are traceable per job, and (b) converge the control-plane job status to
+// failed whenever the message is ultimately routed to the DLQ — otherwise a
+// DLQ-bound job would be left stuck in its last known non-terminal state.
+func (q *Queue) retryOrDLQ(d amqp.Delivery, task ingest.Task, processErr error) {
 	count := extractRetryCount(d.Headers)
 	if count >= maxRetries {
 		slog.Error("rabbitmq: max retries exceeded — routing to DLQ",
+			"job_id", task.JobID, "tenant_id", task.TenantID,
 			"retries", count, "err", processErr)
+		q.markFailed(task, processErr)
 		_ = d.Nack(false, false) // no requeue → DLX → DLQ
 		return
 	}
@@ -250,16 +258,34 @@ func (q *Queue) retryOrDLQ(d amqp.Delivery, processErr error) {
 	select {
 	case <-time.After(delay):
 	case <-q.stopCh:
+		slog.Warn("rabbitmq: queue stopping mid-retry — routing to DLQ",
+			"job_id", task.JobID, "tenant_id", task.TenantID, "retries", count)
+		q.markFailed(task, processErr)
 		_ = d.Nack(false, false)
 		return
 	}
 
 	if err := q.publish(context.Background(), d.Body, count+1); err != nil {
-		slog.Error("rabbitmq: republish for retry failed — routing to DLQ", "err", err)
+		slog.Error("rabbitmq: republish for retry failed — routing to DLQ",
+			"job_id", task.JobID, "tenant_id", task.TenantID, "err", err)
+		q.markFailed(task, err)
 		_ = d.Nack(false, false)
 		return
 	}
 	_ = d.Ack(false) // ack original; retry is the republished copy
+}
+
+// markFailed drives both completers to a terminal failed state so the
+// control-plane job status converges with a message that is being routed to
+// the DLQ. Both calls are best-effort — a completer error is logged but must
+// never block the delivery from being nacked to the DLQ.
+func (q *Queue) markFailed(task ingest.Task, cause error) {
+	message := cause.Error()
+	_ = q.core.CompleteJob(task.TenantID, task.JobID, brainapi.JobFailed, "", message)
+	if _, err := q.gw.HandleJobCompleted(context.Background(), task.TenantID, task.JobID, brainapi.JobFailed, "", message); err != nil {
+		slog.Error("rabbitmq: control-plane failed-status update failed",
+			"job_id", task.JobID, "tenant_id", task.TenantID, "err", err)
+	}
 }
 
 // extractRetryCount reads the x-wb-retry-count header value, defaulting to 0.

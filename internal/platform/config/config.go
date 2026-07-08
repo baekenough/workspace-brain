@@ -23,7 +23,16 @@ type Config struct {
 	// AdminUsers and is populated from CREATE_ALLOW_USERS (comma-separated).
 	// The gateway's PolicyAuthorizer matches entries against both the full
 	// principal key (source:id) and the raw id.
-	CreateAllowUsers  []string
+	CreateAllowUsers []string
+	// HTTPAdminUsers is a server-side allowlist of principal identifiers
+	// granted the "admin" role over the JSON HTTP command API
+	// (internal/control/httpapi.Handler). It is populated from
+	// HTTP_ADMIN_USERS (comma-separated) and mirrors AdminUsers/ADMIN_USERS,
+	// which plays the same role for the Slack adapter: a request over the
+	// shared API_TOKEN can claim a principal ID, but only the server decides
+	// which IDs are admins — client-supplied `principal.roles` in the
+	// request body are never trusted.
+	HTTPAdminUsers    []string
 	PublicBaseURL     string
 	CommandName       string
 	SlackAppName      string
@@ -70,6 +79,7 @@ func FromEnv(getenv LookupFunc) (Config, error) {
 		SlackSigningSecret:   strings.TrimSpace(getenv("SLACK_SIGNING_SECRET")),
 		AdminUsers:           splitList(getenv("ADMIN_USERS")),
 		CreateAllowUsers:     splitList(getenv("CREATE_ALLOW_USERS")),
+		HTTPAdminUsers:       splitList(getenv("HTTP_ADMIN_USERS")),
 		PublicBaseURL:        strings.TrimRight(strings.TrimSpace(getenv("PUBLIC_BASE_URL")), "/"),
 		CommandName:          envOr(getenv, "COMMAND_NAME", defaultCommandName),
 		SlackAppName:         envOr(getenv, "SLACK_APP_NAME", defaultSlackAppName),
@@ -154,6 +164,17 @@ func (c Config) AdminUserSet() map[string]bool {
 func (c Config) CreateAllowlistSet() map[string]bool {
 	set := make(map[string]bool, len(c.CreateAllowUsers))
 	for _, user := range c.CreateAllowUsers {
+		set[user] = true
+	}
+	return set
+}
+
+// HTTPAdminUserSet returns the JSON HTTP command API admin allowlist as a
+// lookup map for internal/control/httpapi.Handler.AdminUsers, mirroring the
+// AdminUserSet pattern.
+func (c Config) HTTPAdminUserSet() map[string]bool {
+	set := make(map[string]bool, len(c.HTTPAdminUsers))
+	for _, user := range c.HTTPAdminUsers {
 		set[user] = true
 	}
 	return set

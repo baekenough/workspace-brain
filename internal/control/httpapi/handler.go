@@ -15,6 +15,14 @@ import (
 type Handler struct {
 	Gateway frontend.Gateway
 	Token   string
+	// AdminUsers is an optional server-side allowlist of principal
+	// identifiers granted the "admin" role over this HTTP surface. It
+	// mirrors the Slack adapter's ADMIN_USERS pattern (see
+	// internal/control/slack.Handler.AdminUsers): the server — not the
+	// caller — decides who is an admin. Set it after construction, e.g.
+	// `handler.AdminUsers = cfg.HTTPAdminUserSet()`. A nil or empty map
+	// means no principal receives the admin role via this handler.
+	AdminUsers map[string]bool
 }
 
 // NewHandler creates a JSON command API handler.
@@ -46,14 +54,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	response, err := frontend.NewDispatcher(h.Gateway).Handle(r.Context(), frontend.Request{
 		BindingKey: brainapi.BindingKey(req.BindingKey),
-		Principal:  req.Principal,
+		Principal:  h.principal(req.Principal),
 		Text:       req.Text,
 	})
 	if err != nil {
 		writeJSON(w, statusFor(err), errorResponse{Error: frontend.SafeMessage(err)})
 		return
 	}
-	writeJSON(w, http.StatusOK, commandResponse{Visibility: response.Visibility, Text: response.Text})
+	writeJSON(w, http.StatusOK, commandResponse{
+		Visibility:         response.Visibility,
+		Text:               response.Text,
+		Sources:            response.Sources,
+		GroundingAvailable: response.GroundingAvailable,
+	})
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
@@ -66,6 +79,22 @@ func (h *Handler) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(h.Token)) == 1
 }
 
+// principal derives the trusted dispatch principal from the client-claimed
+// identity in the request body. The bearer API_TOKEN only proves the caller
+// holds a shared secret, not who the caller is or what roles they hold — so
+// Source and ID are honored as an identity claim, but Roles are never taken
+// from the request body. Roles are always recomputed here from the
+// server-side AdminUsers allowlist, the same trust boundary the Slack
+// adapter enforces via ADMIN_USERS. This prevents any caller with only the
+// shared token from self-asserting "admin" by adding it to the JSON body.
+func (h *Handler) principal(claimed brainapi.Principal) brainapi.Principal {
+	roles := []string{"member"}
+	if h.AdminUsers[claimed.ID] {
+		roles = append(roles, "admin")
+	}
+	return brainapi.Principal{Source: claimed.Source, ID: claimed.ID, Roles: roles}
+}
+
 type commandRequest struct {
 	BindingKey string             `json:"binding_key"`
 	Principal  brainapi.Principal `json:"principal"`
@@ -75,6 +104,12 @@ type commandRequest struct {
 type commandResponse struct {
 	Visibility frontend.Visibility `json:"visibility"`
 	Text       string              `json:"text"`
+	// Sources lists grounded citations for "ask" answers. Omitted (empty)
+	// for non-ask commands and for ungrounded ("모른다") answers.
+	Sources []brainapi.Source `json:"sources,omitempty"`
+	// GroundingAvailable reports whether the underlying query found grounded
+	// evidence backing Sources.
+	GroundingAvailable bool `json:"grounding_available,omitempty"`
 }
 
 type errorResponse struct {

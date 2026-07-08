@@ -34,6 +34,44 @@ func TestHandlerDispatchesTrustedJSONCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerAskExposesSourcesAndGroundingAvailable(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{
+		answer:             "api answer",
+		sources:            []brainapi.Source{{ID: "s1", Title: "Doc One", URI: "https://example.com/doc1", TenantID: "tenant-1"}},
+		groundingAvailable: true,
+	}
+	h := NewHandler(gw, "token")
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1"},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response commandResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !response.GroundingAvailable || len(response.Sources) != 1 || response.Sources[0].Title != "Doc One" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestHandlerAskOmitsSourcesWhenUngrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{answer: "수집된 근거가 없습니다: hello", groundingAvailable: false}
+	h := NewHandler(gw, "token")
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1"},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response commandResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response.GroundingAvailable || len(response.Sources) != 0 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func TestHandlerDispatchesAdminCommand(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{}
@@ -44,6 +82,45 @@ func TestHandlerDispatchesAdminCommand(t *testing.T) {
 	}
 	if gw.projectState.TenantID != "tenant-1" || gw.projectState.State != brainapi.ProjectOn {
 		t.Fatalf("projectState=%+v", gw.projectState)
+	}
+}
+
+func TestHandlerIgnoresClientAssertedAdminRole(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "token")
+	// No server-side AdminUsers allowlist is configured, so a caller must not
+	// be able to self-assert "admin" by putting it in the request body.
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"attacker","roles":["admin"]},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("client-asserted admin role was trusted: %+v", gw.asked.Principal)
+	}
+	if !gw.asked.Principal.HasRole("member") {
+		t.Fatalf("expected default member role, got: %+v", gw.asked.Principal)
+	}
+}
+
+func TestHandlerGrantsAdminOnlyViaServerSideAllowlist(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "token")
+	h.AdminUsers = map[string]bool{"trusted-admin": true}
+
+	// A client claiming to be "attacker" with roles:["admin"] must not receive
+	// the admin role even though the handler has an admin allowlist configured.
+	perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"attacker","roles":["admin"]},"text":"ask hello"}`, "token")
+	if gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("non-allowlisted principal was granted admin: %+v", gw.asked.Principal)
+	}
+
+	// A client claiming the allowlisted ID (without asserting roles) receives
+	// the admin role, assigned by the server, not the client.
+	perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"trusted-admin"},"text":"ask hello"}`, "token")
+	if !gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("allowlisted principal was not granted admin: %+v", gw.asked.Principal)
 	}
 }
 
@@ -136,10 +213,12 @@ func perform(t *testing.T, h *Handler, method, body, token string) *httptest.Res
 }
 
 type fakeGateway struct {
-	asked        gateway.AskCommand
-	projectState gateway.SetProjectStateCommand
-	answer       string
-	err          error
+	asked              gateway.AskCommand
+	projectState       gateway.SetProjectStateCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	err                error
 }
 
 func (f *fakeGateway) CreateProject(context.Context, gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
@@ -154,7 +233,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if f.err != nil {
 		return brainapi.QueryResponse{}, f.err
 	}
-	return brainapi.QueryResponse{Answer: f.answer}, nil
+	return brainapi.QueryResponse{Answer: f.answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(context.Context, gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {
@@ -200,4 +279,25 @@ func (f *fakeGateway) AdminListJobs(context.Context, gateway.AdminListJobsComman
 }
 func (f *fakeGateway) AdminGetJob(context.Context, gateway.AdminGetJobCommand) (brainapi.JobSnapshot, error) {
 	return brainapi.JobSnapshot{}, f.err
+}
+
+func (f *fakeGateway) CreateSharedTenant(_ context.Context, cmd gateway.CreateSharedTenantCommand) (gateway.CreateSharedTenantResult, error) {
+	if f.err != nil {
+		return gateway.CreateSharedTenantResult{}, f.err
+	}
+	return gateway.CreateSharedTenantResult{TenantID: cmd.TenantID}, nil
+}
+
+func (f *fakeGateway) BindSharedTenant(_ context.Context, cmd gateway.BindSharedTenantCommand) (gateway.BindSharedTenantResult, error) {
+	if f.err != nil {
+		return gateway.BindSharedTenantResult{}, f.err
+	}
+	return gateway.BindSharedTenantResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID}, nil
+}
+
+func (f *fakeGateway) PromoteToShared(_ context.Context, cmd gateway.PromoteToSharedCommand) (gateway.PromoteToSharedResult, error) {
+	if f.err != nil {
+		return gateway.PromoteToSharedResult{}, f.err
+	}
+	return gateway.PromoteToSharedResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID, SourceID: cmd.SourceID}, nil
 }

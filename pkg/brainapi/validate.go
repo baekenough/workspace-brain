@@ -40,3 +40,13 @@ func ValidateJobID(id JobID) error {
 	}
 	return nil
 }
+
+// ValidateSourceID checks the source identifier referenced by a
+// PromoteRequest (see SharedKnowledgeCore.PromoteSource).
+func ValidateSourceID(id string) error {
+	const op = "validate_source_id"
+	if strings.TrimSpace(id) == "" {
+		return invalidf(op, "source id is required")
+	}
+	return nil
+}
