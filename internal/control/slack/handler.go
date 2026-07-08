@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sangyi/workspace-brain/internal/control/frontend"
@@ -29,6 +30,9 @@ type Handler struct {
 	CommandName   string
 	AdminUsers    map[string]bool
 	Now           func() time.Time
+
+	dedup     *dedupCache
+	dedupOnce sync.Once
 }
 
 // NewHandler creates a Slack handler with safe defaults.
@@ -64,7 +68,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	response, err := h.dispatch(r.Context(), values)
+	if h.dedupCache().seenRecently(dedupKeyFromBody(values.Get("trigger_id"), body)) {
+		writeJSON(w, http.StatusOK, ephemeral(duplicateMessage(r)))
+		return
+	}
+	response, err := h.dispatch(r.Context(), values.Get("channel_id"), values.Get("user_id"), values.Get("text"))
 	if err != nil {
 		h.writeError(w, http.StatusOK, safeMessage(err))
 		return
@@ -72,7 +80,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-// ServeInteraction verifies and acknowledges Slack interactivity requests.
+// ServeInteraction verifies Slack interactivity requests, parses the
+// block_actions payload, and dispatches the triggering action. Interaction
+// types this adapter does not recognize (or requests carrying no payload at
+// all) are acknowledged generically for forward compatibility.
 func (h *Handler) ServeInteraction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, "POST만 지원합니다.")
@@ -91,7 +102,73 @@ func (h *Handler) ServeInteraction(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "Slack 서명 검증 실패")
 		return
 	}
-	writeJSON(w, http.StatusOK, ephemeral("상호작용 요청이 접수되었습니다."))
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "interaction payload form 파싱 실패")
+		return
+	}
+	raw := values.Get("payload")
+	if raw == "" {
+		writeJSON(w, http.StatusOK, ephemeral("상호작용 요청이 접수되었습니다."))
+		return
+	}
+	var payload interactionPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		h.writeError(w, http.StatusBadRequest, "interaction payload 파싱 실패")
+		return
+	}
+	if !payload.supported() {
+		writeJSON(w, http.StatusOK, ephemeral("상호작용 요청이 접수되었습니다."))
+		return
+	}
+	if h.dedupCache().seenRecently(dedupKeyFromBody(payload.TriggerID, body)) {
+		writeJSON(w, http.StatusOK, ephemeral(duplicateMessage(r)))
+		return
+	}
+	response, err := h.handleAction(r.Context(), payload)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ephemeral(safeMessage(err)))
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// dedupCache returns h's lazily-initialized retry/duplicate guard.
+func (h *Handler) dedupCache() *dedupCache {
+	h.dedupOnce.Do(func() {
+		h.dedup = newDedupCache(dedupTTL)
+	})
+	return h.dedup
+}
+
+// dedupKeyFromBody derives a stable identity for a Slack delivery. Slack
+// assigns a fresh trigger_id to every distinct user interaction (slash
+// command invocation or block action click), but resends the identical
+// trigger_id when at-least-once retrying the same delivery, so it is a
+// precise dedup key. When trigger_id is unavailable, the raw body is hashed
+// as a fallback so identical retried payloads are still recognized.
+func dedupKeyFromBody(triggerID string, body []byte) string {
+	if triggerID != "" {
+		return "trigger:" + triggerID
+	}
+	sum := sha256.Sum256(body)
+	return "body:" + hex.EncodeToString(sum[:])
+}
+
+// isSlackRetry reports whether Slack marked r as a retried delivery via the
+// X-Slack-Retry-Num header (https://api.slack.com/apis/connections/events-api#retries).
+func isSlackRetry(r *http.Request) bool {
+	return r.Header.Get("X-Slack-Retry-Num") != ""
+}
+
+// duplicateMessage renders the user-facing ack for a request the dedup
+// cache recognized as already processed, mentioning Slack's retry mechanism
+// when the request was explicitly flagged as a retry.
+func duplicateMessage(r *http.Request) string {
+	if isSlackRetry(r) {
+		return "Slack 재시도 요청이 감지되어 중복 처리를 건너뛰었습니다."
+	}
+	return "이미 처리된 요청입니다."
 }
 
 func (h *Handler) verify(r *http.Request, body []byte) error {
@@ -132,11 +209,11 @@ func (h *Handler) validateCommand(command string) error {
 	return nil
 }
 
-func (h *Handler) dispatch(ctx context.Context, values url.Values) (slackResponse, error) {
+func (h *Handler) dispatch(ctx context.Context, channelID, userID, text string) (slackResponse, error) {
 	response, err := frontend.NewDispatcher(h.Gateway).Handle(ctx, frontend.Request{
-		BindingKey: brainapi.BindingKey("slack:channel:" + values.Get("channel_id")),
-		Principal:  h.principal(values.Get("user_id")),
-		Text:       values.Get("text"),
+		BindingKey: brainapi.BindingKey("slack:channel:" + channelID),
+		Principal:  h.principal(userID),
+		Text:       text,
 	})
 	if err != nil {
 		return slackResponse{}, err
