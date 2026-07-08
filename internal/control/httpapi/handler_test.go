@@ -280,3 +280,24 @@ func (f *fakeGateway) AdminListJobs(context.Context, gateway.AdminListJobsComman
 func (f *fakeGateway) AdminGetJob(context.Context, gateway.AdminGetJobCommand) (brainapi.JobSnapshot, error) {
 	return brainapi.JobSnapshot{}, f.err
 }
+
+func (f *fakeGateway) CreateSharedTenant(_ context.Context, cmd gateway.CreateSharedTenantCommand) (gateway.CreateSharedTenantResult, error) {
+	if f.err != nil {
+		return gateway.CreateSharedTenantResult{}, f.err
+	}
+	return gateway.CreateSharedTenantResult{TenantID: cmd.TenantID}, nil
+}
+
+func (f *fakeGateway) BindSharedTenant(_ context.Context, cmd gateway.BindSharedTenantCommand) (gateway.BindSharedTenantResult, error) {
+	if f.err != nil {
+		return gateway.BindSharedTenantResult{}, f.err
+	}
+	return gateway.BindSharedTenantResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID}, nil
+}
+
+func (f *fakeGateway) PromoteToShared(_ context.Context, cmd gateway.PromoteToSharedCommand) (gateway.PromoteToSharedResult, error) {
+	if f.err != nil {
+		return gateway.PromoteToSharedResult{}, f.err
+	}
+	return gateway.PromoteToSharedResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID, SourceID: cmd.SourceID}, nil
+}

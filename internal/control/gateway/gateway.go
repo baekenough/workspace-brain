@@ -481,6 +481,152 @@ func (g *Gateway) AdminGetJob(ctx context.Context, cmd AdminGetJobCommand) (brai
 	return g.core.AdminGetJob(ctx, cmd.TenantID, cmd.JobID)
 }
 
+// ─── Shared knowledge tenant admin surface (issue #12) ──────────────────────
+//
+// These methods are the gateway-side authorization boundary for the optional
+// brainapi.SharedKnowledgeCore extension. Core implementations are not
+// required to support shared tenants, so every method type-asserts g.core
+// against brainapi.SharedKnowledgeCore and fails closed with KindInvalid when
+// the underlying core has not adopted it. Authorization is always evaluated
+// (and audited) before the type assertion result is consulted, so a denied
+// caller learns nothing about server-side core capability.
+
+// CreateSharedTenantCommand asks the gateway to provision a shared knowledge
+// tenant. There is no BindingKey: shared tenants are never resolvable via
+// ResolveBinding and are only reachable through the admin surface.
+type CreateSharedTenantCommand struct {
+	Principal brainapi.Principal
+	TenantID  brainapi.TenantID
+	Metadata  map[string]string
+}
+
+// CreateSharedTenantResult confirms the provisioned shared tenant.
+type CreateSharedTenantResult struct {
+	TenantID brainapi.TenantID
+}
+
+// CreateSharedTenant authorizes an admin principal (ActionAdmin) and asks the
+// core to provision a shared knowledge tenant.
+func (g *Gateway) CreateSharedTenant(ctx context.Context, cmd CreateSharedTenantCommand) (CreateSharedTenantResult, error) {
+	const op = "gateway_create_shared_tenant"
+	if err := brainapi.ValidateTenantID(cmd.TenantID); err != nil {
+		return CreateSharedTenantResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.TenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.TenantID, authErr)
+	if authErr != nil {
+		return CreateSharedTenantResult{}, brainapi.SafeAccessError(op)
+	}
+	sk, ok := g.core.(brainapi.SharedKnowledgeCore)
+	if !ok {
+		return CreateSharedTenantResult{}, brainapi.E(brainapi.KindInvalid, op, "core does not support shared knowledge tenants", nil)
+	}
+	if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+		TenantID:       cmd.TenantID,
+		OwnerPrincipal: cmd.Principal,
+		Metadata:       cloneMap(cmd.Metadata),
+	}); err != nil {
+		return CreateSharedTenantResult{}, err
+	}
+	return CreateSharedTenantResult{TenantID: cmd.TenantID}, nil
+}
+
+// BindSharedTenantCommand asks the gateway to register that queries scoped to
+// ProjectTenantID also search SharedTenantID. There is no client-facing
+// equivalent of this request: it must only be constructed from trusted,
+// admin-approved input (see brainapi.BindSharedTenantRequest).
+type BindSharedTenantCommand struct {
+	Principal       brainapi.Principal
+	ProjectTenantID brainapi.TenantID
+	SharedTenantID  brainapi.TenantID
+}
+
+// BindSharedTenantResult confirms the registered binding.
+type BindSharedTenantResult struct {
+	ProjectTenantID brainapi.TenantID
+	SharedTenantID  brainapi.TenantID
+}
+
+// BindSharedTenant authorizes an admin principal (ActionAdmin) and asks the
+// core to register the project-to-shared-tenant binding.
+func (g *Gateway) BindSharedTenant(ctx context.Context, cmd BindSharedTenantCommand) (BindSharedTenantResult, error) {
+	const op = "gateway_bind_shared_tenant"
+	if err := brainapi.ValidateTenantID(cmd.ProjectTenantID); err != nil {
+		return BindSharedTenantResult{}, err
+	}
+	if err := brainapi.ValidateTenantID(cmd.SharedTenantID); err != nil {
+		return BindSharedTenantResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Principal, TenantID: cmd.ProjectTenantID, Action: brainapi.ActionAdmin})
+	g.emitAuthAudit(cmd.Principal.Key(), brainapi.ActionAdmin, cmd.ProjectTenantID, authErr)
+	if authErr != nil {
+		return BindSharedTenantResult{}, brainapi.SafeAccessError(op)
+	}
+	sk, ok := g.core.(brainapi.SharedKnowledgeCore)
+	if !ok {
+		return BindSharedTenantResult{}, brainapi.E(brainapi.KindInvalid, op, "core does not support shared knowledge tenants", nil)
+	}
+	if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+		ProjectTenantID: cmd.ProjectTenantID,
+		SharedTenantID:  cmd.SharedTenantID,
+	}); err != nil {
+		return BindSharedTenantResult{}, err
+	}
+	return BindSharedTenantResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID}, nil
+}
+
+// PromoteToSharedCommand asks the gateway to copy a single already-ingested
+// project source into a shared tenant that is currently bound to it.
+type PromoteToSharedCommand struct {
+	Admin           brainapi.Principal
+	ProjectTenantID brainapi.TenantID
+	SharedTenantID  brainapi.TenantID
+	SourceID        string
+}
+
+// PromoteToSharedResult confirms the promoted source.
+type PromoteToSharedResult struct {
+	ProjectTenantID brainapi.TenantID
+	SharedTenantID  brainapi.TenantID
+	SourceID        string
+}
+
+// PromoteToShared authorizes brainapi.ActionPromoteToShared — which, per
+// contract, requires the same admin principal as ActionAdmin — and asks the
+// core to copy the named project source into the bound shared tenant. This is
+// the gateway's only write path into shared tenant content; direct Ingest
+// against a shared tenant is always rejected by Core implementations.
+func (g *Gateway) PromoteToShared(ctx context.Context, cmd PromoteToSharedCommand) (PromoteToSharedResult, error) {
+	const op = "gateway_promote_to_shared"
+	if err := brainapi.ValidateTenantID(cmd.ProjectTenantID); err != nil {
+		return PromoteToSharedResult{}, err
+	}
+	if err := brainapi.ValidateTenantID(cmd.SharedTenantID); err != nil {
+		return PromoteToSharedResult{}, err
+	}
+	if err := brainapi.ValidateSourceID(cmd.SourceID); err != nil {
+		return PromoteToSharedResult{}, err
+	}
+	authErr := g.authorizer.Authorize(ctx, AuthorizationRequest{Principal: cmd.Admin, TenantID: cmd.ProjectTenantID, Action: brainapi.ActionPromoteToShared})
+	g.emitAuthAudit(cmd.Admin.Key(), brainapi.ActionPromoteToShared, cmd.ProjectTenantID, authErr)
+	if authErr != nil {
+		return PromoteToSharedResult{}, brainapi.SafeAccessError(op)
+	}
+	sk, ok := g.core.(brainapi.SharedKnowledgeCore)
+	if !ok {
+		return PromoteToSharedResult{}, brainapi.E(brainapi.KindInvalid, op, "core does not support shared knowledge tenants", nil)
+	}
+	if err := sk.PromoteSource(ctx, brainapi.PromoteRequest{
+		Admin:           cmd.Admin,
+		ProjectTenantID: cmd.ProjectTenantID,
+		SharedTenantID:  cmd.SharedTenantID,
+		SourceID:        cmd.SourceID,
+	}); err != nil {
+		return PromoteToSharedResult{}, err
+	}
+	return PromoteToSharedResult{ProjectTenantID: cmd.ProjectTenantID, SharedTenantID: cmd.SharedTenantID, SourceID: cmd.SourceID}, nil
+}
+
 // HandleJobCompleted applies a core callback to the control-plane store.
 func (g *Gateway) HandleJobCompleted(ctx context.Context, tenantID brainapi.TenantID, jobID brainapi.JobID, status brainapi.JobStatus, resultRef string, message string) (brainapi.JobSnapshot, error) {
 	_ = ctx

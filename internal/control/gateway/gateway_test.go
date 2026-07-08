@@ -306,6 +306,289 @@ func (f *fakeCore) AdminGetJob(context.Context, brainapi.TenantID, brainapi.JobI
 	return f.adminGetJobResp, f.adminErr
 }
 
+// ── Shared knowledge tenant admin surface (issue #12) ─────────────────────────
+
+// fakeSharedCore extends fakeCore with brainapi.SharedKnowledgeCore support so
+// gateway tests can exercise the CreateSharedTenant/BindSharedTenant/
+// PromoteToShared type-assertion path. fakeCore itself deliberately does NOT
+// implement SharedKnowledgeCore, so tests using plain fakeCore exercise the
+// "core does not support shared knowledge tenants" branch.
+type fakeSharedCore struct {
+	*fakeCore
+	createSharedReq   brainapi.CreateSharedTenantRequest
+	createSharedErr   error
+	bindSharedReq     brainapi.BindSharedTenantRequest
+	bindSharedErr     error
+	sharedBindings    []brainapi.TenantID
+	sharedBindingsErr error
+	promoteReq        brainapi.PromoteRequest
+	promoteErr        error
+}
+
+func newFakeSharedCore() *fakeSharedCore {
+	return &fakeSharedCore{fakeCore: newFakeCore()}
+}
+
+func (f *fakeSharedCore) CreateSharedTenant(_ context.Context, req brainapi.CreateSharedTenantRequest) error {
+	f.createSharedReq = req
+	return f.createSharedErr
+}
+
+func (f *fakeSharedCore) BindSharedTenant(_ context.Context, req brainapi.BindSharedTenantRequest) error {
+	f.bindSharedReq = req
+	return f.bindSharedErr
+}
+
+func (f *fakeSharedCore) SharedBindings(_ context.Context, _ brainapi.TenantID) ([]brainapi.TenantID, error) {
+	return f.sharedBindings, f.sharedBindingsErr
+}
+
+func (f *fakeSharedCore) PromoteSource(_ context.Context, req brainapi.PromoteRequest) error {
+	f.promoteReq = req
+	return f.promoteErr
+}
+
+var _ brainapi.SharedKnowledgeCore = (*fakeSharedCore)(nil)
+
+// TestGatewayCreateSharedTenant verifies admin-only authorization, the
+// unsupported-core fail-closed branch, input validation, and core-error
+// propagation.
+func TestGatewayCreateSharedTenant(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+
+	// Allow: admin + supporting core.
+	core := newFakeSharedCore()
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := gw.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: admin, TenantID: "shared-1", Metadata: map[string]string{"k": "v"}})
+	if err != nil {
+		t.Fatalf("CreateSharedTenant allow: %v", err)
+	}
+	if result.TenantID != "shared-1" || core.createSharedReq.TenantID != "shared-1" || core.createSharedReq.OwnerPrincipal.Key() != "admin" || core.createSharedReq.Metadata["k"] != "v" {
+		t.Fatalf("result=%+v request=%+v", result, core.createSharedReq)
+	}
+
+	// Deny: member principal.
+	_, err = gw.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: member, TenantID: "shared-2"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member CreateSharedTenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid tenant ID.
+	_, err = gw.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: admin, TenantID: "bad tenant"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad tenant CreateSharedTenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Unsupported core (plain fakeCore does not implement SharedKnowledgeCore).
+	plainGW, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New plain: %v", err)
+	}
+	_, err = plainGW.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: admin, TenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("unsupported core kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Core error propagates.
+	errCore := newFakeSharedCore()
+	errCore.createSharedErr = brainapi.E(brainapi.KindAlreadyExists, "create_shared", "dup", nil)
+	errGW, err := New(errCore, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New err: %v", err)
+	}
+	_, err = errGW.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: admin, TenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+		t.Fatalf("core err kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayCreateSharedTenantEmitsAuditEvents verifies allow and deny audit
+// events for CreateSharedTenant.
+func TestGatewayCreateSharedTenantEmitsAuditEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeSharedCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+	if _, err := gw.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: admin, TenantID: "shared-1"}); err != nil {
+		t.Fatalf("CreateSharedTenant: %v", err)
+	}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+	if _, err := gw.CreateSharedTenant(ctx, CreateSharedTenantCommand{Principal: member, TenantID: "shared-2"}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 2 || events[0].Decision != audit.DecisionAllow || events[0].Action != brainapi.ActionAdmin || events[1].Decision != audit.DecisionDeny {
+		t.Fatalf("audit events = %+v", events)
+	}
+}
+
+// TestGatewayBindSharedTenant verifies admin-only authorization, the
+// unsupported-core branch, input validation, and core-error propagation.
+func TestGatewayBindSharedTenant(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+
+	core := newFakeSharedCore()
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := gw.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1"})
+	if err != nil {
+		t.Fatalf("BindSharedTenant allow: %v", err)
+	}
+	if result.ProjectTenantID != "project-1" || result.SharedTenantID != "shared-1" || core.bindSharedReq.ProjectTenantID != "project-1" || core.bindSharedReq.SharedTenantID != "shared-1" {
+		t.Fatalf("result=%+v request=%+v", result, core.bindSharedReq)
+	}
+
+	// Deny: member principal.
+	_, err = gw.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: member, ProjectTenantID: "project-1", SharedTenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member BindSharedTenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid project tenant ID.
+	_, err = gw.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: admin, ProjectTenantID: "bad tenant", SharedTenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad project tenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid shared tenant ID.
+	_, err = gw.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: admin, ProjectTenantID: "project-1", SharedTenantID: "bad tenant"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad shared tenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Unsupported core.
+	plainGW, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New plain: %v", err)
+	}
+	_, err = plainGW.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("unsupported core kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Core error propagates.
+	errCore := newFakeSharedCore()
+	errCore.bindSharedErr = brainapi.E(brainapi.KindNotFound, "bind_shared", "missing", nil)
+	errGW, err := New(errCore, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New err: %v", err)
+	}
+	_, err = errGW.BindSharedTenant(ctx, BindSharedTenantCommand{Principal: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1"})
+	if !brainapi.IsKind(err, brainapi.KindNotFound) {
+		t.Fatalf("core err kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayPromoteToShared verifies ActionPromoteToShared admin-only
+// authorization (member and no-role denied, admin allowed), the
+// unsupported-core branch, input validation, and core-error propagation.
+func TestGatewayPromoteToShared(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+
+	core := newFakeSharedCore()
+	gw, err := New(core, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	result, err := gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"})
+	if err != nil {
+		t.Fatalf("PromoteToShared allow: %v", err)
+	}
+	if result.SourceID != "source-1" || core.promoteReq.Admin.Key() != "admin" || core.promoteReq.ProjectTenantID != "project-1" || core.promoteReq.SharedTenantID != "shared-1" || core.promoteReq.SourceID != "source-1" {
+		t.Fatalf("result=%+v request=%+v", result, core.promoteReq)
+	}
+
+	// Deny: member principal (ActionPromoteToShared requires admin role, same as ActionAdmin).
+	_, err = gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: member, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member PromoteToShared kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Invalid inputs.
+	_, err = gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "bad tenant", SharedTenantID: "shared-1", SourceID: "source-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad project tenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	_, err = gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "bad tenant", SourceID: "source-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("bad shared tenant kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	_, err = gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: ""})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("empty source id kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Unsupported core.
+	plainGW, err := New(newFakeCore(), RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New plain: %v", err)
+	}
+	_, err = plainGW.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"})
+	if !brainapi.IsKind(err, brainapi.KindInvalid) {
+		t.Fatalf("unsupported core kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+
+	// Core error propagates.
+	errCore := newFakeSharedCore()
+	errCore.promoteErr = brainapi.E(brainapi.KindConflict, "promote", "not bound", nil)
+	errGW, err := New(errCore, RoleAuthorizer{}, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("New err: %v", err)
+	}
+	_, err = errGW.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"})
+	if !brainapi.IsKind(err, brainapi.KindConflict) {
+		t.Fatalf("core err kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+}
+
+// TestGatewayPromoteToSharedEmitsAuditEvents verifies that PromoteToShared
+// authorization decisions are audited with brainapi.ActionPromoteToShared.
+func TestGatewayPromoteToSharedEmitsAuditEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	spy := &spyAuditLogger{}
+	gw, err := New(newFakeSharedCore(), RoleAuthorizer{}, jobs.NewStore(), WithAuditLogger(spy))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	admin := brainapi.Principal{ID: "admin", Roles: []string{"admin"}}
+	if _, err := gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: admin, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"}); err != nil {
+		t.Fatalf("PromoteToShared: %v", err)
+	}
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+	if _, err := gw.PromoteToShared(ctx, PromoteToSharedCommand{Admin: member, ProjectTenantID: "project-1", SharedTenantID: "shared-1", SourceID: "source-1"}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("expected unauthorized: %v", err)
+	}
+	events := spy.all()
+	if len(events) != 2 {
+		t.Fatalf("expected 2 audit events, got %d: %+v", len(events), events)
+	}
+	if events[0].Action != brainapi.ActionPromoteToShared || events[0].Decision != audit.DecisionAllow {
+		t.Errorf("allow event = %+v", events[0])
+	}
+	if events[1].Action != brainapi.ActionPromoteToShared || events[1].Decision != audit.DecisionDeny {
+		t.Errorf("deny event = %+v", events[1])
+	}
+}
+
 func TestRoleAuthorizerBranches(t *testing.T) {
 	t.Parallel()
 	a := RoleAuthorizer{}
@@ -315,6 +598,12 @@ func TestRoleAuthorizerBranches(t *testing.T) {
 	}
 	if err := a.Authorize(ctx, AuthorizationRequest{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, Action: brainapi.ActionCreateProject}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
 		t.Fatalf("member create kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	if err := a.Authorize(ctx, AuthorizationRequest{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, Action: brainapi.ActionPromoteToShared}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("member promote_to_shared kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	if err := a.Authorize(ctx, AuthorizationRequest{Principal: brainapi.Principal{ID: "U1", Roles: []string{"admin"}}, Action: brainapi.ActionPromoteToShared}); err != nil {
+		t.Fatalf("admin promote_to_shared: %v", err)
 	}
 	if err := a.Authorize(ctx, AuthorizationRequest{Principal: brainapi.Principal{ID: "U1", Roles: []string{"member"}}, Action: brainapi.ActionQuery}); err != nil {
 		t.Fatalf("member query: %v", err)

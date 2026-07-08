@@ -20,7 +20,7 @@ func (RoleAuthorizer) Authorize(ctx context.Context, req AuthorizationRequest) e
 	if req.Principal.HasRole("admin") {
 		return nil
 	}
-	if req.Action == brainapi.ActionCreateProject || req.Action == brainapi.ActionAdmin {
+	if req.Action == brainapi.ActionCreateProject || req.Action == brainapi.ActionAdmin || req.Action == brainapi.ActionPromoteToShared {
 		return brainapi.E(brainapi.KindUnauthorized, "authorize", "admin role is required", nil)
 	}
 	if req.Principal.HasRole("member") {
@@ -61,6 +61,8 @@ func NewPolicyAuthorizer(createAllowlist map[string]bool) PolicyAuthorizer {
 //   - Admin role: allowed for all actions.
 //   - ActionCreateProject: allowed for admins and allowlisted principals.
 //   - ActionAdmin: allowed for admins only.
+//   - ActionPromoteToShared: allowed for admins only (same gating as ActionAdmin;
+//     see brainapi.ActionPromoteToShared).
 //   - All other actions: allowed for principals with the "member" role.
 func (a PolicyAuthorizer) Authorize(ctx context.Context, req AuthorizationRequest) error {
 	_ = ctx
@@ -76,7 +78,7 @@ func (a PolicyAuthorizer) Authorize(ctx context.Context, req AuthorizationReques
 		}
 		return brainapi.E(brainapi.KindUnauthorized, "authorize", "admin role or create allowlist required", nil)
 	}
-	if req.Action == brainapi.ActionAdmin {
+	if req.Action == brainapi.ActionAdmin || req.Action == brainapi.ActionPromoteToShared {
 		return brainapi.E(brainapi.KindUnauthorized, "authorize", "admin role is required", nil)
 	}
 	if req.Principal.HasRole("member") {
@@ -95,7 +97,7 @@ func (a PolicyAuthorizer) isAllowlisted(p brainapi.Principal) bool {
 // isSensitiveAction reports whether the action must always be re-verified live,
 // bypassing the membership cache.
 func isSensitiveAction(action brainapi.Action) bool {
-	return action == brainapi.ActionAdmin || action == brainapi.ActionCreateProject
+	return action == brainapi.ActionAdmin || action == brainapi.ActionCreateProject || action == brainapi.ActionPromoteToShared
 }
 
 // authCacheKey uniquely identifies a cached authorization decision.

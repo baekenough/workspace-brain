@@ -29,6 +29,7 @@ func TestPolicyAuthorizerAdminRoleAllowsAll(t *testing.T) {
 	for _, action := range []brainapi.Action{
 		brainapi.ActionCreateProject,
 		brainapi.ActionAdmin,
+		brainapi.ActionPromoteToShared,
 		brainapi.ActionQuery,
 		brainapi.ActionDiscover,
 		brainapi.ActionIngest,
@@ -37,6 +38,25 @@ func TestPolicyAuthorizerAdminRoleAllowsAll(t *testing.T) {
 		if err := a.Authorize(ctx, AuthorizationRequest{Principal: admin, Action: action}); err != nil {
 			t.Fatalf("admin action %q: %v", action, err)
 		}
+	}
+}
+
+// TestPolicyAuthorizerPromoteToSharedRequiresAdminRole verifies that
+// ActionPromoteToShared is gated identically to ActionAdmin: neither the
+// create allowlist nor the member role grants it (see
+// brainapi.ActionPromoteToShared doc comment).
+func TestPolicyAuthorizerPromoteToSharedRequiresAdminRole(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// Even an allowlisted user cannot perform ActionPromoteToShared without the admin role.
+	a := NewPolicyAuthorizer(map[string]bool{"U1": true})
+	member := brainapi.Principal{ID: "U1", Roles: []string{"member"}}
+	if err := a.Authorize(ctx, AuthorizationRequest{Principal: member, Action: brainapi.ActionPromoteToShared}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("allowlisted member promote_to_shared: kind=%q err=%v", brainapi.KindOf(err), err)
+	}
+	noRole := brainapi.Principal{ID: "U2"}
+	if err := a.Authorize(ctx, AuthorizationRequest{Principal: noRole, Action: brainapi.ActionPromoteToShared}); !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("no-role promote_to_shared: kind=%q err=%v", brainapi.KindOf(err), err)
 	}
 }
 
@@ -144,7 +164,7 @@ func TestCachingAuthorizerSensitiveActionsAlwaysBypassCache(t *testing.T) {
 	admin := brainapi.Principal{ID: "A", Roles: []string{"admin"}}
 	req := AuthorizationRequest{Principal: admin, TenantID: "tenant-1"}
 
-	for _, action := range []brainapi.Action{brainapi.ActionAdmin, brainapi.ActionCreateProject} {
+	for _, action := range []brainapi.Action{brainapi.ActionAdmin, brainapi.ActionCreateProject, brainapi.ActionPromoteToShared} {
 		req.Action = action
 		for i := 0; i < 3; i++ {
 			if err := ca.Authorize(ctx, req); err != nil {
@@ -152,9 +172,9 @@ func TestCachingAuthorizerSensitiveActionsAlwaysBypassCache(t *testing.T) {
 			}
 		}
 	}
-	// 3 calls each for 2 sensitive actions = 6 live delegate calls; no caching.
-	if delegate.calls != 6 {
-		t.Fatalf("sensitive actions: expected 6 delegate calls, got %d", delegate.calls)
+	// 3 calls each for 3 sensitive actions = 9 live delegate calls; no caching.
+	if delegate.calls != 9 {
+		t.Fatalf("sensitive actions: expected 9 delegate calls, got %d", delegate.calls)
 	}
 }
 
