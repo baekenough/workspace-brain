@@ -35,3 +35,28 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
+
+  integration-test:
+    name: integration test (postgres, qdrant, rabbitmq adapters)
+    runs-on: ubuntu-latest
+    # Container startup (image pulls + testcontainers reaper) is slower than
+    # the unit suite; bound the job so a stuck container fails fast instead of
+    # burning the full default 6h runner timeout.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      # No `services:` block here: the postgres/qdrant/rabbitmq adapter tests
+      # use testcontainers-go (see internal/core/postgres, internal/core/qdrant,
+      # internal/control/rabbitmq *_integration_test.go). Each test starts and
+      # tears down its own ephemeral container via the runner's Docker daemon,
+      # which ubuntu-latest provides out of the box — a fixed `services:`
+      # container would sit unused since these tests never read a pre-set
+      # DSN/URL from the environment.
+      - name: docker version
+        run: docker version
+      - name: integration tests (testcontainers; requires Docker)
+        run: make test-integration

@@ -1,4 +1,4 @@
-.PHONY: build vet test race coverage-out coverage demo docker-build dev-up dev-down dev-logs help
+.PHONY: build vet test race coverage-out coverage test-integration demo docker-build dev-up dev-down dev-logs help
 
 IMAGE ?= workspace-brain:local
 COVERAGE_PROFILE ?= coverage.out
@@ -26,6 +26,13 @@ coverage-out:
 ## Generate and enforce the configured coverage threshold.
 coverage: coverage-out
 	./scripts/check-coverage.sh $(COVERAGE_PROFILE)
+
+## Run integration tests (postgres, qdrant, rabbitmq adapters) via testcontainers. Requires Docker.
+test-integration:
+	go test -tags=integration -race \
+		./internal/core/postgres/... \
+		./internal/core/qdrant/... \
+		./internal/control/rabbitmq/...
 
 ## Run the built-in demo flow.
 demo:
