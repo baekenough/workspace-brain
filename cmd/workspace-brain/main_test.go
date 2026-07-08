@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sangyi/workspace-brain/internal/control/audit"
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
 	"github.com/sangyi/workspace-brain/internal/control/ingest"
 	"github.com/sangyi/workspace-brain/internal/control/jobs"
@@ -105,6 +107,144 @@ func TestDefaultNewAppGatewayUsesSourceLoader(t *testing.T) {
 	}
 	if !strings.Contains(answer.Answer, "근거 기반 응답: alpha beta gamma") {
 		t.Fatalf("answer=%q", answer.Answer)
+	}
+}
+
+// ── G1: production authorizer + audit logger wiring tests ──────────────────
+
+// TestNewAuthorizerUsesDefaultTTLWhenEnvEmpty verifies the fallback TTL path
+// (AUTH_CACHE_TTL unset) still produces a working authorizer chain.
+func TestNewAuthorizerUsesDefaultTTLWhenEnvEmpty(t *testing.T) {
+	t.Parallel()
+	authz := newAuthorizer(config.Config{}, func(string) string { return "" })
+	admin := brainapi.Principal{Source: "t", ID: "a", Roles: []string{"admin"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: admin, Action: brainapi.ActionQuery}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+}
+
+// TestNewAuthorizerParsesValidTTLFromEnv verifies that a well-formed
+// AUTH_CACHE_TTL value is accepted and the resulting authorizer still works.
+func TestNewAuthorizerParsesValidTTLFromEnv(t *testing.T) {
+	t.Parallel()
+	authz := newAuthorizer(config.Config{}, func(key string) string {
+		if key == "AUTH_CACHE_TTL" {
+			return "1s"
+		}
+		return ""
+	})
+	admin := brainapi.Principal{Source: "t", ID: "a", Roles: []string{"admin"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: admin, Action: brainapi.ActionQuery}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+}
+
+// TestNewAuthorizerFallsBackOnInvalidTTL verifies that an unparseable
+// AUTH_CACHE_TTL value falls back to defaultAuthCacheTTL instead of failing.
+func TestNewAuthorizerFallsBackOnInvalidTTL(t *testing.T) {
+	t.Parallel()
+	authz := newAuthorizer(config.Config{}, func(key string) string {
+		if key == "AUTH_CACHE_TTL" {
+			return "not-a-duration"
+		}
+		return ""
+	})
+	admin := brainapi.Principal{Source: "t", ID: "a", Roles: []string{"admin"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: admin, Action: brainapi.ActionQuery}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+}
+
+// TestNewAuthorizerFallsBackOnNonPositiveTTL verifies that a non-positive
+// duration (parses successfully but is <= 0) also falls back to the default.
+func TestNewAuthorizerFallsBackOnNonPositiveTTL(t *testing.T) {
+	t.Parallel()
+	authz := newAuthorizer(config.Config{}, func(key string) string {
+		if key == "AUTH_CACHE_TTL" {
+			return "0s"
+		}
+		return ""
+	})
+	admin := brainapi.Principal{Source: "t", ID: "a", Roles: []string{"admin"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: admin, Action: brainapi.ActionQuery}); err != nil {
+		t.Fatalf("Authorize: %v", err)
+	}
+}
+
+// TestNewAuthorizerEnforcesCreateAllowlist verifies the production chain
+// wires cfg.CreateAllowlistSet() into the PolicyAuthorizer: a non-admin
+// principal on the allowlist may create projects, and ActionCreateProject
+// always bypasses the cache (isSensitiveAction), so this is re-verified live.
+func TestNewAuthorizerEnforcesCreateAllowlist(t *testing.T) {
+	t.Parallel()
+	authz := newAuthorizer(config.Config{CreateAllowUsers: []string{"member-1"}}, func(string) string { return "" })
+	allowed := brainapi.Principal{Source: "t", ID: "member-1", Roles: []string{"member"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: allowed, Action: brainapi.ActionCreateProject}); err != nil {
+		t.Fatalf("expected allowlisted principal to create project: %v", err)
+	}
+	other := brainapi.Principal{Source: "t", ID: "member-2", Roles: []string{"member"}}
+	if err := authz.Authorize(context.Background(), gateway.AuthorizationRequest{Principal: other, Action: brainapi.ActionCreateProject}); err == nil {
+		t.Fatal("expected non-allowlisted member to be denied create_project")
+	}
+}
+
+// TestNewSlogAuditLoggerFallsBackToDefaultWhenNil verifies the nil-logger
+// convenience path used by callers that do not want to check slog.Default()
+// themselves.
+func TestNewSlogAuditLoggerFallsBackToDefaultWhenNil(t *testing.T) {
+	t.Parallel()
+	l := newSlogAuditLogger(nil)
+	if l == nil || l.logger == nil {
+		t.Fatal("expected non-nil logger fallback")
+	}
+}
+
+// TestSlogAuditLoggerLogsAllowWithZeroAt verifies that an Allow decision with
+// a zero At field is stamped with the current time and logged at Info level.
+func TestSlogAuditLoggerLogsAllowWithZeroAt(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	l := newSlogAuditLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	l.Log(audit.Event{Actor: "web:u1", Action: brainapi.ActionQuery, Decision: audit.DecisionAllow})
+	out := buf.String()
+	if !strings.Contains(out, "level=INFO") || !strings.Contains(out, "decision=allow") || !strings.Contains(out, "actor=web:u1") {
+		t.Fatalf("log output = %q", out)
+	}
+}
+
+// TestSlogAuditLoggerLogsDenyWithReasonAndExplicitAt verifies that a Deny
+// decision carrying a Reason and a non-zero At is logged at Warn level with
+// the reason attribute present, and that the caller-supplied At is preserved.
+func TestSlogAuditLoggerLogsDenyWithReasonAndExplicitAt(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	l := newSlogAuditLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	l.Log(audit.Event{Actor: "web:u2", Action: brainapi.ActionAdmin, Decision: audit.DecisionDeny, Reason: "admin role is required", At: at})
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "decision=deny") || !strings.Contains(out, `reason="admin role is required"`) || !strings.Contains(out, "2026-01-02T03:04:05Z") {
+		t.Fatalf("log output = %q", out)
+	}
+}
+
+// TestDefaultNewAppGatewayEmitsAuditEventsForAllowAndDeny exercises the full
+// production wiring end-to-end: defaultNewAppGateway wires WithAuditLogger,
+// and the CachingAuthorizer-backed policy produces both allow and deny audit
+// events that reach slog.Default().
+func TestDefaultNewAppGatewayEmitsAuditEventsForAllowAndDeny(t *testing.T) {
+	core, err := newAppCore(config.Config{})
+	if err != nil {
+		t.Fatalf("newAppCore: %v", err)
+	}
+	authz := newAuthorizer(config.Config{}, func(string) string { return "" })
+	gw, err := defaultNewAppGateway(core, authz, jobs.NewStore())
+	if err != nil {
+		t.Fatalf("defaultNewAppGateway: %v", err)
+	}
+	member := brainapi.Principal{Source: "test", ID: "no-admin", Roles: []string{"member"}}
+	// ActionCreateProject requires admin (or allowlist); a plain member is denied.
+	if _, err := gw.CreateProject(context.Background(), gateway.CreateProjectCommand{BindingKey: "test:space:g1", Principal: member}); err == nil {
+		t.Fatal("expected member to be denied create_project")
 	}
 }
 

@@ -13,7 +13,9 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
+	"github.com/sangyi/workspace-brain/internal/control/audit"
 	"github.com/sangyi/workspace-brain/internal/control/gateway"
 	"github.com/sangyi/workspace-brain/internal/control/httpapi"
 	"github.com/sangyi/workspace-brain/internal/control/ingest"
@@ -132,7 +134,7 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 		return err
 	}
 	jobStore := jobs.NewStore()
-	gw, err := newAppGateway(core, gateway.RoleAuthorizer{}, jobStore)
+	gw, err := newAppGateway(core, newAuthorizer(cfg, getenv), jobStore)
 	if err != nil {
 		return err
 	}
@@ -172,8 +174,85 @@ func runServer(ctx context.Context, getenv envFunc, serve serveFunc) error {
 }
 
 func defaultNewAppGateway(core brainapi.Core, authorizer gateway.Authorizer, store *jobs.Store) (appGateway, error) {
-	return gateway.New(core, authorizer, store, gateway.WithSourceLoader(sources.NewLoader()))
+	return gateway.New(core, authorizer, store,
+		gateway.WithSourceLoader(sources.NewLoader()),
+		gateway.WithAuditLogger(newSlogAuditLogger(slog.Default())),
+	)
 }
+
+// defaultAuthCacheTTL is the fallback membership-cache TTL for the production
+// caching authorizer when AUTH_CACHE_TTL is unset or fails to parse.
+const defaultAuthCacheTTL = 5 * time.Minute
+
+// newAuthorizer builds the production authorizer chain wired to the server's
+// environment configuration:
+//
+//   - gateway.PolicyAuthorizer enforces the admin-only create/admin policy,
+//     plus an optional create-allowlist populated from CREATE_ALLOW_USERS via
+//     cfg.CreateAllowlistSet().
+//   - gateway.CachingAuthorizer wraps the policy with a TTL membership cache
+//     so repeated non-sensitive checks (query/discover/ingest/status) avoid
+//     redundant delegate calls. Sensitive actions (admin, create_project)
+//     always bypass the cache (see gateway.isSensitiveAction), so a stale
+//     cache entry can never grant elevated access.
+//
+// AUTH_CACHE_TTL configures the cache TTL using Go duration syntax (e.g.
+// "5m"). An empty or invalid value falls back to defaultAuthCacheTTL.
+func newAuthorizer(cfg config.Config, getenv envFunc) gateway.Authorizer {
+	policy := gateway.NewPolicyAuthorizer(cfg.CreateAllowlistSet())
+	ttl := defaultAuthCacheTTL
+	if raw := strings.TrimSpace(getenv("AUTH_CACHE_TTL")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
+			ttl = parsed
+		}
+	}
+	return gateway.NewCachingAuthorizer(policy, ttl, nil)
+}
+
+// slogAuditLogger adapts a *slog.Logger to the audit.Logger interface so that
+// gateway authorization decisions flow through the same structured logging
+// pipeline (JSON or text, selected by LOG_FORMAT) as the rest of the server,
+// instead of a separately formatted output stream.
+type slogAuditLogger struct {
+	logger *slog.Logger
+}
+
+// newSlogAuditLogger returns an audit.Logger backed by logger. A nil logger
+// falls back to slog.Default() so callers never need a nil check.
+func newSlogAuditLogger(logger *slog.Logger) *slogAuditLogger {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &slogAuditLogger{logger: logger}
+}
+
+// Log implements audit.Logger. Denied decisions are logged at Warn level so
+// operators can alert on repeated authorization failures; allowed decisions
+// are logged at Info level to preserve a full audit trail.
+func (l *slogAuditLogger) Log(e audit.Event) {
+	at := e.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	attrs := []any{
+		"at", at.UTC().Format(time.RFC3339),
+		"actor", e.Actor,
+		"action", string(e.Action),
+		"tenant", string(e.TenantID),
+		"decision", string(e.Decision),
+	}
+	if e.Reason != "" {
+		attrs = append(attrs, "reason", e.Reason)
+	}
+	if e.Decision == audit.DecisionDeny {
+		l.logger.Warn("gateway authorization decision", attrs...)
+		return
+	}
+	l.logger.Info("gateway authorization decision", attrs...)
+}
+
+// compile-time check: slogAuditLogger satisfies audit.Logger.
+var _ audit.Logger = (*slogAuditLogger)(nil)
 
 // openAIEmbeddingDimensions is the MRL target dimension for text-embedding-3-*
 // models. Vectors longer than this are truncated; shorter vectors are an error.
