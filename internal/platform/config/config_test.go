@@ -14,6 +14,8 @@ func TestFromEnvDefaultsAndTypedValues(t *testing.T) {
 			return " token "
 		case "ADMIN_USERS":
 			return " U1, U2, U1 ,, "
+		case "HTTP_ADMIN_USERS":
+			return " H1, H2, H1 ,, "
 		case "PUBLIC_BASE_URL":
 			return "https://example.com/"
 		case "DATA_PATH":
@@ -52,6 +54,13 @@ func TestFromEnvDefaultsAndTypedValues(t *testing.T) {
 	admins := cfg.AdminUserSet()
 	if !admins["U1"] || !admins["U2"] || admins[""] {
 		t.Fatalf("AdminUserSet = %+v", admins)
+	}
+	if got := strings.Join(cfg.HTTPAdminUsers, ","); got != "H1,H2" {
+		t.Fatalf("HTTPAdminUsers = %q", got)
+	}
+	httpAdmins := cfg.HTTPAdminUserSet()
+	if !httpAdmins["H1"] || !httpAdmins["H2"] || httpAdmins[""] || httpAdmins["U1"] {
+		t.Fatalf("HTTPAdminUserSet = %+v", httpAdmins)
 	}
 }
 

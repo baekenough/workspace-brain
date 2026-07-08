@@ -85,6 +85,45 @@ func TestHandlerDispatchesAdminCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerIgnoresClientAssertedAdminRole(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "token")
+	// No server-side AdminUsers allowlist is configured, so a caller must not
+	// be able to self-assert "admin" by putting it in the request body.
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"attacker","roles":["admin"]},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("client-asserted admin role was trusted: %+v", gw.asked.Principal)
+	}
+	if !gw.asked.Principal.HasRole("member") {
+		t.Fatalf("expected default member role, got: %+v", gw.asked.Principal)
+	}
+}
+
+func TestHandlerGrantsAdminOnlyViaServerSideAllowlist(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{}
+	h := NewHandler(gw, "token")
+	h.AdminUsers = map[string]bool{"trusted-admin": true}
+
+	// A client claiming to be "attacker" with roles:["admin"] must not receive
+	// the admin role even though the handler has an admin allowlist configured.
+	perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"attacker","roles":["admin"]},"text":"ask hello"}`, "token")
+	if gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("non-allowlisted principal was granted admin: %+v", gw.asked.Principal)
+	}
+
+	// A client claiming the allowlisted ID (without asserting roles) receives
+	// the admin role, assigned by the server, not the client.
+	perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"trusted-admin"},"text":"ask hello"}`, "token")
+	if !gw.asked.Principal.HasRole("admin") {
+		t.Fatalf("allowlisted principal was not granted admin: %+v", gw.asked.Principal)
+	}
+}
+
 func TestHandlerRequiresBearerToken(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(&fakeGateway{}, "token")

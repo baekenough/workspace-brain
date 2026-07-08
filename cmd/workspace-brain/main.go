@@ -386,7 +386,9 @@ func buildHandler(cfg config.Config, gw appGateway) (http.Handler, error) {
 		}
 	}
 	if cfg.APIToken != "" {
-		mux.Handle("/api/commands", httpapi.NewHandler(gw, cfg.APIToken))
+		apiHandler := httpapi.NewHandler(gw, cfg.APIToken)
+		apiHandler.AdminUsers = cfg.HTTPAdminUserSet()
+		mux.Handle("/api/commands", apiHandler)
 	}
 
 	// Wrap the mux with operational middleware.

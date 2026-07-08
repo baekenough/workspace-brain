@@ -255,6 +255,13 @@ func TestRunServerJSONAPIIngestUsesDefaultSourceLoader(t *testing.T) {
 		switch key {
 		case "API_TOKEN":
 			return "token"
+		case "HTTP_ADMIN_USERS":
+			// "admin" is granted the admin role via the server-side
+			// allowlist (config.HTTPAdminUserSet), not via the
+			// client-claimed "roles" field in the request body below. See
+			// internal/control/httpapi.Handler.principal for the trust
+			// boundary this test exercises.
+			return "admin"
 		default:
 			return ""
 		}
