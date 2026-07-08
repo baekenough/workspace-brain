@@ -756,4 +756,332 @@ func RunContractSuite(t *testing.T, newCore func() brainapi.Core) {
 			t.Fatalf("invalid job id: want Invalid, got kind=%q err=%v", brainapi.KindOf(err), err)
 		}
 	})
+
+	// ─── Grounding tier (#12) ─────────────────────────────────────────────────
+	//
+	// Source.Tier is a base Core requirement (not gated behind
+	// SharedKnowledgeCore): every source returned by an ordinary project-tenant
+	// query must report TierProject.
+
+	t.Run("source_tier_defaults_to_project", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		const tenantID brainapi.TenantID = "contract-tier-default-tenant"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID:       tenantID,
+			BindingKey:     "api:space:CTIERDEF",
+			OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: tenantID,
+			JobID:    "contract-tier-default-job",
+			Source:   brainapi.SourceRef{URI: "file://tier.txt", Name: "tier.txt"},
+			Metadata: map[string]string{"content": "tier default project content alpha"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		resp, err := core.Query(ctx, brainapi.QueryRequest{TenantID: tenantID, Question: "tier alpha"})
+		if err != nil {
+			t.Fatalf("Query: %v", err)
+		}
+		if !resp.GroundingAvailable || len(resp.Sources) == 0 {
+			t.Fatalf("expected grounded sources, got %+v", resp)
+		}
+		for _, src := range resp.Sources {
+			if src.Tier != brainapi.TierProject {
+				t.Fatalf("source Tier = %q, want %q", src.Tier, brainapi.TierProject)
+			}
+		}
+	})
+
+	// ─── Shared knowledge tenant (#12, SharedKnowledgeCore) ──────────────────
+	//
+	// These tests exercise the optional brainapi.SharedKnowledgeCore extension.
+	// A Core implementation that does not (yet) implement it — e.g. postgres
+	// before its C2 follow-up — skips these sub-tests rather than failing, so
+	// the base suite stays green while the shared-tenant contract is adopted
+	// incrementally across backends.
+
+	sharedCoreOrSkip := func(t *testing.T, core brainapi.Core) brainapi.SharedKnowledgeCore {
+		t.Helper()
+		sk, ok := core.(brainapi.SharedKnowledgeCore)
+		if !ok {
+			t.Skip("core does not implement brainapi.SharedKnowledgeCore; skipping shared-tenant contract tests")
+		}
+		return sk
+	}
+
+	adminPrincipal := brainapi.Principal{ID: "root", Roles: []string{"admin"}}
+
+	t.Run("shared_tenant_query_includes_bound_content_with_shared_tier", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		sk := sharedCoreOrSkip(t, core)
+
+		// originTenant owns the source that gets promoted; it is never queried.
+		const originTenant brainapi.TenantID = "contract-shared-origin"
+		// queryTenant has no matching content of its own; it only sees the
+		// promoted content because sharedTenant is bound to it.
+		const queryTenant brainapi.TenantID = "contract-shared-query"
+		const sharedTenant brainapi.TenantID = "contract-shared-tenant"
+
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: originTenant, BindingKey: "api:space:CSHORIGIN", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject origin: %v", err)
+		}
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: queryTenant, BindingKey: "api:space:CSHQUERY", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject query: %v", err)
+		}
+		if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+			TenantID: sharedTenant, OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		// originTenant must be bound too: PromoteSource requires the
+		// destination shared tenant to already be bound to the promoting
+		// project tenant (see PromoteRequest doc comment).
+		if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: originTenant, SharedTenantID: sharedTenant,
+		}); err != nil {
+			t.Fatalf("BindSharedTenant origin: %v", err)
+		}
+		if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: queryTenant, SharedTenantID: sharedTenant,
+		}); err != nil {
+			t.Fatalf("BindSharedTenant query: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: originTenant,
+			JobID:    "contract-shared-origin-job",
+			Source:   brainapi.SourceRef{URI: "file://shared-origin.txt", Name: "shared-origin.txt"},
+			Metadata: map[string]string{"content": "promotable shared keyword zulu content"},
+		}); err != nil {
+			t.Fatalf("Ingest origin: %v", err)
+		}
+		originSources, err := core.AdminListSources(ctx, originTenant)
+		if err != nil {
+			t.Fatalf("AdminListSources origin: %v", err)
+		}
+		if len(originSources.Sources) != 1 {
+			t.Fatalf("expected 1 origin source, got %d", len(originSources.Sources))
+		}
+
+		if err := sk.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin:           adminPrincipal,
+			ProjectTenantID: originTenant,
+			SharedTenantID:  sharedTenant,
+			SourceID:        originSources.Sources[0].ID,
+		}); err != nil {
+			t.Fatalf("PromoteSource: %v", err)
+		}
+
+		// queryTenant itself never ingested anything with "zulu", so any
+		// grounding must come from the bound shared tenant.
+		resp, err := core.Query(ctx, brainapi.QueryRequest{TenantID: queryTenant, Question: "shared keyword zulu"})
+		if err != nil {
+			t.Fatalf("Query queryTenant: %v", err)
+		}
+		if !resp.GroundingAvailable {
+			t.Fatalf("expected grounding from bound shared tenant, got %+v", resp)
+		}
+		var sawShared bool
+		for _, src := range resp.Sources {
+			if src.TenantID == originTenant {
+				t.Fatalf("query tenant unexpectedly saw origin project tenant's source directly: %+v", src)
+			}
+			if src.TenantID == sharedTenant {
+				sawShared = true
+				if src.Tier != brainapi.TierShared {
+					t.Fatalf("shared source Tier = %q, want %q", src.Tier, brainapi.TierShared)
+				}
+			}
+		}
+		if !sawShared {
+			t.Fatalf("expected a source from bound shared tenant %q, got %+v", sharedTenant, resp.Sources)
+		}
+	})
+
+	t.Run("shared_tenant_unbound_not_in_scope", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		sk := sharedCoreOrSkip(t, core)
+
+		const originTenant brainapi.TenantID = "contract-shared-unbound-origin"
+		const unboundTenant brainapi.TenantID = "contract-shared-unbound-query"
+		const sharedTenant brainapi.TenantID = "contract-shared-unbound-tenant"
+
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: originTenant, BindingKey: "api:space:CSHUBORIGIN", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject origin: %v", err)
+		}
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: unboundTenant, BindingKey: "api:space:CSHUBQUERY", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject unbound: %v", err)
+		}
+		if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+			TenantID: sharedTenant, OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		// originTenant must be bound so PromoteSource (which requires the
+		// destination shared tenant to be bound to the promoting project
+		// tenant) succeeds below. unboundTenant is deliberately never bound
+		// to sharedTenant — that is exactly the relationship under test.
+		if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: originTenant, SharedTenantID: sharedTenant,
+		}); err != nil {
+			t.Fatalf("BindSharedTenant origin: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: originTenant,
+			JobID:    "contract-shared-unbound-origin-job",
+			Source:   brainapi.SourceRef{URI: "file://unbound-origin.txt", Name: "unbound-origin.txt"},
+			Metadata: map[string]string{"content": "unbound shared keyword yankee content"},
+		}); err != nil {
+			t.Fatalf("Ingest origin: %v", err)
+		}
+		originSources, err := core.AdminListSources(ctx, originTenant)
+		if err != nil {
+			t.Fatalf("AdminListSources origin: %v", err)
+		}
+		if err := sk.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin:           adminPrincipal,
+			ProjectTenantID: originTenant,
+			SharedTenantID:  sharedTenant,
+			SourceID:        originSources.Sources[0].ID,
+		}); err != nil {
+			t.Fatalf("PromoteSource: %v", err)
+		}
+
+		resp, err := core.Query(ctx, brainapi.QueryRequest{TenantID: unboundTenant, Question: "shared keyword yankee"})
+		if err != nil {
+			t.Fatalf("Query unboundTenant: %v", err)
+		}
+		if resp.GroundingAvailable {
+			t.Fatalf("unbound project unexpectedly saw shared tenant content: %+v", resp)
+		}
+		for _, src := range resp.Sources {
+			if src.TenantID == sharedTenant {
+				t.Fatalf("unbound project query returned a source from an unbound shared tenant: %+v", src)
+			}
+		}
+	})
+
+	t.Run("shared_tenant_direct_ingest_rejected", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		sk := sharedCoreOrSkip(t, core)
+
+		const sharedTenant brainapi.TenantID = "contract-shared-direct-ingest"
+		if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+			TenantID: sharedTenant, OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: sharedTenant,
+			JobID:    "contract-shared-direct-ingest-job",
+			Source:   brainapi.SourceRef{URI: "file://direct.txt"},
+		})
+		if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+			t.Fatalf("direct ingest into shared tenant: want Unauthorized, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("shared_tenant_promote_requires_admin", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		sk := sharedCoreOrSkip(t, core)
+
+		const projectTenant brainapi.TenantID = "contract-shared-promote-noadmin-project"
+		const sharedTenant brainapi.TenantID = "contract-shared-promote-noadmin-shared"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: projectTenant, BindingKey: "api:space:CSHPNA", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+			TenantID: sharedTenant, OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: projectTenant, SharedTenantID: sharedTenant,
+		}); err != nil {
+			t.Fatalf("BindSharedTenant: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: projectTenant,
+			JobID:    "contract-shared-promote-noadmin-job",
+			Source:   brainapi.SourceRef{URI: "file://noadmin.txt", Name: "noadmin.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		sources, err := core.AdminListSources(ctx, projectTenant)
+		if err != nil {
+			t.Fatalf("AdminListSources: %v", err)
+		}
+		nonAdmin := brainapi.Principal{ID: "member-1", Roles: []string{"member"}}
+		err = sk.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin:           nonAdmin,
+			ProjectTenantID: projectTenant,
+			SharedTenantID:  sharedTenant,
+			SourceID:        sources.Sources[0].ID,
+		})
+		if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+			t.Fatalf("promote without admin: want Unauthorized, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("shared_tenant_bindings_reflect_registered_binding", func(t *testing.T) {
+		t.Parallel()
+		core := newCore()
+		sk := sharedCoreOrSkip(t, core)
+
+		const projectTenant brainapi.TenantID = "contract-shared-bindings-project"
+		const sharedTenant brainapi.TenantID = "contract-shared-bindings-shared"
+		if err := core.CreateProject(ctx, brainapi.CreateProjectRequest{
+			TenantID: projectTenant, BindingKey: "api:space:CSHBIND", OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateProject: %v", err)
+		}
+		if err := sk.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{
+			TenantID: sharedTenant, OwnerPrincipal: brainapi.Principal{ID: "owner"},
+		}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		before, err := sk.SharedBindings(ctx, projectTenant)
+		if err != nil {
+			t.Fatalf("SharedBindings before bind: %v", err)
+		}
+		if len(before) != 0 {
+			t.Fatalf("expected no bindings before BindSharedTenant, got %+v", before)
+		}
+		if err := sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: projectTenant, SharedTenantID: sharedTenant,
+		}); err != nil {
+			t.Fatalf("BindSharedTenant: %v", err)
+		}
+		after, err := sk.SharedBindings(ctx, projectTenant)
+		if err != nil {
+			t.Fatalf("SharedBindings after bind: %v", err)
+		}
+		if len(after) != 1 || after[0] != sharedTenant {
+			t.Fatalf("SharedBindings = %+v, want [%q]", after, sharedTenant)
+		}
+		// Duplicate binding must be rejected.
+		err = sk.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{
+			ProjectTenantID: projectTenant, SharedTenantID: sharedTenant,
+		})
+		if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+			t.Fatalf("duplicate binding: want AlreadyExists, got kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
 }

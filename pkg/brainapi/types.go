@@ -31,6 +31,12 @@ const (
 	ActionStatus Action = "status"
 	// ActionAdmin changes tenant lifecycle state.
 	ActionAdmin Action = "admin"
+	// ActionPromoteToShared copies approved project-tenant content into a
+	// shared knowledge tenant that is bound to it (see SharedKnowledgeCore).
+	// It is the only write path into shared tenant content; direct Ingest
+	// against a shared tenant is always rejected by Core implementations.
+	// Authorizers MUST require the same admin principal as ActionAdmin.
+	ActionPromoteToShared Action = "promote_to_shared"
 )
 
 // Principal is the surface-neutral identity created by an adapter.
@@ -65,12 +71,34 @@ type SourceRef struct {
 	Name     string
 }
 
+// Tier classifies which layer a grounded Source (and, informally, the tenant
+// that produced it) belongs to. It is purely additive metadata: it does not
+// change tenant isolation, and clients cannot set it — Core implementations
+// stamp it based on which kind of tenant a chunk was ingested into.
+type Tier string
+
+const (
+	// TierProject means the content originates from an ordinary project
+	// tenant provisioned via CreateProject.
+	TierProject Tier = "project"
+	// TierShared means the content originates from a shared knowledge tenant
+	// provisioned via SharedKnowledgeCore.CreateSharedTenant. Shared tenant
+	// content only reaches a query's results when the querying project
+	// tenant has an active SharedKnowledgeCore.BindSharedTenant relationship
+	// with that shared tenant.
+	TierShared Tier = "shared"
+)
+
 // Source describes a grounded source returned by query.
 type Source struct {
 	ID       string
 	Title    string
 	URI      string
 	TenantID TenantID
+	// Tier reports whether this source came from the querying project tenant
+	// (TierProject) or from a shared knowledge tenant bound to it
+	// (TierShared). See Tier and SharedKnowledgeCore.
+	Tier Tier
 }
 
 // CreateProjectRequest asks the core to atomically provision a tenant.
@@ -79,6 +107,64 @@ type CreateProjectRequest struct {
 	BindingKey     BindingKey
 	OwnerPrincipal Principal
 	Metadata       map[string]string
+}
+
+// ─── Shared knowledge tenant (#12) ──────────────────────────────────────────
+//
+// A shared tenant is a server-side-only concept: it is provisioned via
+// CreateSharedTenant (never CreateProject) and has no BindingKey, so it is
+// never resolvable via ResolveBinding and can never be the direct TenantID of
+// a client-issued QueryRequest/DiscoverRequest/IngestRequest in a way that a
+// client controls. A project tenant only gains visibility into a shared
+// tenant's content after an admin registers a BindSharedTenant relationship;
+// Core then unions the shared tenant into that project's Query/Discover scope
+// automatically. QueryRequest.TenantID and DiscoverRequest.TenantID remain
+// single project tenant values — clients cannot request a shared scope
+// directly, and cross-project unions (project A seeing project B's data)
+// remain forbidden; only "project ∪ tenants explicitly bound to it" expands.
+//
+// These types are consumed through the optional SharedKnowledgeCore
+// extension interface (see below), not through the base Core interface, so
+// that Core implementations which have not yet adopted shared tenants keep
+// compiling and passing the base conformance suite unchanged.
+
+// CreateSharedTenantRequest asks the core to provision a shared knowledge
+// tenant. Shared tenants have no BindingKey and are never resolvable via
+// ResolveBinding.
+type CreateSharedTenantRequest struct {
+	TenantID       TenantID
+	OwnerPrincipal Principal
+	Metadata       map[string]string
+}
+
+// BindSharedTenantRequest registers a server-side binding from ProjectTenantID
+// to SharedTenantID: subsequent Query/Discover calls scoped to ProjectTenantID
+// also search SharedTenantID. There is no client-facing equivalent of this
+// request — gateways must construct it only from trusted, admin-approved
+// input, never from request-body fields a caller controls.
+type BindSharedTenantRequest struct {
+	ProjectTenantID TenantID
+	SharedTenantID  TenantID
+}
+
+// PromoteRequest asks the core to copy a single already-ingested project
+// source into a shared tenant that is currently bound to it. This is the only
+// path that writes content into a shared tenant; Core implementations must
+// always reject a direct Ingest whose TenantID names a shared tenant.
+type PromoteRequest struct {
+	// Admin is the promoting principal. Core implementations must reject the
+	// request with KindUnauthorized unless Admin.HasRole("admin").
+	Admin Principal
+	// ProjectTenantID is the project tenant that owns the source being
+	// promoted.
+	ProjectTenantID TenantID
+	// SharedTenantID is the destination shared tenant. It must already be
+	// bound to ProjectTenantID via BindSharedTenant.
+	SharedTenantID TenantID
+	// SourceID identifies the specific project-tenant source to copy, using
+	// the same identifier scheme as SourceInfo.ID (as returned by
+	// AdminListSources).
+	SourceID string
 }
 
 // IngestRequest asks the core to enqueue source processing.
@@ -253,4 +339,47 @@ type Core interface {
 	// AdminGetJob returns a single job snapshot for the given tenant and job.
 	// The implementation must not check project state.
 	AdminGetJob(ctx context.Context, tenantID TenantID, jobID JobID) (JobSnapshot, error)
+}
+
+// SharedKnowledgeCore is an optional extension to Core implemented by data
+// cores that support the server-side shared-tenant binding mechanism
+// (issue #12). Core implementations are NOT required to implement this
+// interface; callers MUST use a type assertion, e.g.:
+//
+//	if sk, ok := core.(brainapi.SharedKnowledgeCore); ok { ... }
+//
+// This keeps the mechanism additive: a Core implementation that has not yet
+// adopted shared tenants keeps compiling and keeps passing the base
+// coretest.RunContractSuite conformance suite unchanged. Once an
+// implementation adds SharedKnowledgeCore, the coretest suite automatically
+// exercises the shared-tenant contract tests against it as well.
+type SharedKnowledgeCore interface {
+	// CreateSharedTenant provisions a shared knowledge tenant. It never
+	// creates a BindingKey entry, so the tenant is not resolvable via
+	// ResolveBinding. Returns KindAlreadyExists if TenantID is already in use
+	// (by a project or another shared tenant).
+	CreateSharedTenant(ctx context.Context, req CreateSharedTenantRequest) error
+
+	// BindSharedTenant registers that queries/discovery scoped to
+	// req.ProjectTenantID must also search req.SharedTenantID. Returns
+	// KindNotFound if either tenant does not exist, KindInvalid if
+	// req.ProjectTenantID is itself a shared tenant or req.SharedTenantID was
+	// not created via CreateSharedTenant, and KindAlreadyExists if the
+	// binding already exists.
+	BindSharedTenant(ctx context.Context, req BindSharedTenantRequest) error
+
+	// SharedBindings returns the shared tenant IDs currently bound to
+	// project, in registration order. A project with no shared bindings (or
+	// an unrecognized project ID) returns an empty slice and a nil error —
+	// this is never treated as an error condition.
+	SharedBindings(ctx context.Context, project TenantID) ([]TenantID, error)
+
+	// PromoteSource is the sole path that writes content into a shared
+	// tenant; direct Ingest against a shared tenant is always rejected with
+	// KindUnauthorized regardless of caller. PromoteSource itself returns
+	// KindUnauthorized unless req.Admin.HasRole("admin"), KindNotFound if
+	// req.ProjectTenantID, req.SharedTenantID, or req.SourceID cannot be
+	// resolved, and KindInvalid if req.SharedTenantID is not currently bound
+	// to req.ProjectTenantID via BindSharedTenant.
+	PromoteSource(ctx context.Context, req PromoteRequest) error
 }

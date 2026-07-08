@@ -229,6 +229,11 @@ type Core struct {
 	jobs            map[string]brainapi.JobSnapshot
 	sources         map[brainapi.TenantID][]brainapi.SourceRef
 	docs            map[brainapi.TenantID][]document
+	// sharedBindings maps a project tenant ID to the shared tenant IDs bound
+	// to it (see brainapi.SharedKnowledgeCore), in registration order. Only
+	// project tenants appear as keys; shared tenants never bind other shared
+	// tenants.
+	sharedBindings map[brainapi.TenantID][]brainapi.TenantID
 }
 
 type project struct {
@@ -236,7 +241,27 @@ type project struct {
 	metadata  map[string]string
 	state     brainapi.ProjectState
 	createdAt time.Time
+	// tier distinguishes an ordinary project tenant (brainapi.TierProject,
+	// the default) from a shared knowledge tenant (brainapi.TierShared)
+	// provisioned via CreateSharedTenant. The zero value ("") is treated
+	// identically to TierProject throughout this package.
+	tier brainapi.Tier
 }
+
+// isShared reports whether p is a shared knowledge tenant. The zero value of
+// tier ("") is deliberately treated as a project tenant so that snapshots
+// persisted before the tier field existed keep behaving as project tenants
+// after reload (see persistence.go, which does not yet round-trip tier).
+func (p project) isShared() bool {
+	return p.tier == brainapi.TierShared
+}
+
+// Compile-time interface checks: Core must satisfy both the base contract and
+// the optional shared-knowledge-tenant extension (#12).
+var (
+	_ brainapi.Core                = (*Core)(nil)
+	_ brainapi.SharedKnowledgeCore = (*Core)(nil)
+)
 
 type document struct {
 	source  brainapi.SourceRef
@@ -347,17 +372,18 @@ func NewPersistent(path string, opts ...Option) (*Core, error) {
 
 func newCore(opts ...Option) *Core {
 	c := &Core{
-		now:         time.Now,
-		embedder:    localEmbedder{},
-		vectorStore: newInMemoryVectorStore(),
-		synthesizer: localSynthesizer{},
-		reranker:    localReranker{},
-		topN:        3,
-		bindings:    make(map[brainapi.BindingKey]brainapi.TenantID),
-		projects:    make(map[brainapi.TenantID]project),
-		jobs:        make(map[string]brainapi.JobSnapshot),
-		sources:     make(map[brainapi.TenantID][]brainapi.SourceRef),
-		docs:        make(map[brainapi.TenantID][]document),
+		now:            time.Now,
+		embedder:       localEmbedder{},
+		vectorStore:    newInMemoryVectorStore(),
+		synthesizer:    localSynthesizer{},
+		reranker:       localReranker{},
+		topN:           3,
+		bindings:       make(map[brainapi.BindingKey]brainapi.TenantID),
+		projects:       make(map[brainapi.TenantID]project),
+		jobs:           make(map[string]brainapi.JobSnapshot),
+		sources:        make(map[brainapi.TenantID][]brainapi.SourceRef),
+		docs:           make(map[brainapi.TenantID][]document),
+		sharedBindings: make(map[brainapi.TenantID][]brainapi.TenantID),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -408,7 +434,7 @@ func (c *Core) CreateProject(ctx context.Context, req brainapi.CreateProjectRequ
 	if _, ok := c.bindings[req.BindingKey]; ok {
 		return brainapi.E(brainapi.KindAlreadyExists, "create_project", "binding already exists", nil)
 	}
-	c.projects[req.TenantID] = project{owner: req.OwnerPrincipal, metadata: cloneMap(req.Metadata), state: brainapi.ProjectOn, createdAt: c.now().UTC()}
+	c.projects[req.TenantID] = project{owner: req.OwnerPrincipal, metadata: cloneMap(req.Metadata), state: brainapi.ProjectOn, createdAt: c.now().UTC(), tier: brainapi.TierProject}
 	c.bindings[req.BindingKey] = req.TenantID
 	if err := c.persistLocked(); err != nil {
 		delete(c.projects, req.TenantID)
@@ -437,6 +463,9 @@ func (c *Core) Ingest(ctx context.Context, req brainapi.IngestRequest) error {
 	}
 	if err := c.requireProjectLocked(req.TenantID, "ingest"); err != nil {
 		return err
+	}
+	if c.projects[req.TenantID].isShared() {
+		return brainapi.E(brainapi.KindUnauthorized, "ingest", "direct ingest into a shared tenant is not allowed; use SharedKnowledgeCore.PromoteSource", nil)
 	}
 	key := jobKey(req.TenantID, req.JobID)
 	if _, ok := c.jobs[key]; ok {
@@ -544,8 +573,18 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	// Fetch a candidate set larger than topN so the Reranker has room to
 	// reorder. The default localReranker reproduces the VectorStore ordering,
 	// so for local tests the final top-N is identical to the previous behaviour.
+	//
+	// Scope is [req.TenantID] ∪ [shared tenants bound to req.TenantID] (see
+	// scopeTenantsLocked and brainapi.SharedKnowledgeCore). Candidates from
+	// every tenant in scope are merged before reranking so relevance ranking
+	// treats project and bound-shared content as one pool; strict isolation
+	// is preserved because scope never includes another project tenant or an
+	// unbound shared tenant.
 	candidateN := c.topN * 3
-	candidates := c.vectorStore.Search(req.TenantID, questionTerms, questionVector, candidateN)
+	var candidates []Chunk
+	for _, tid := range c.scopeTenantsLocked(req.TenantID) {
+		candidates = append(candidates, c.vectorStore.Search(tid, questionTerms, questionVector, candidateN)...)
+	}
 	if len(candidates) == 0 {
 		return brainapi.QueryResponse{Answer: "수집된 근거가 없습니다: " + question, GroundingAvailable: false}, nil
 	}
@@ -603,12 +642,15 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 		return brainapi.DiscoverResponse{}, err
 	}
 	queryTerms := terms(req.Query)
+	scope := c.scopeTenantsLocked(req.TenantID)
 	results := make([]brainapi.MetadataResult, 0, len(c.docs[req.TenantID]))
-	for i, doc := range c.docs[req.TenantID] {
-		if len(queryTerms) > 0 && overlap(queryTerms, terms(doc.title+" "+doc.source.URI+" "+doc.content)) == 0 {
-			continue
+	for _, tid := range scope {
+		for i, doc := range c.docs[tid] {
+			if len(queryTerms) > 0 && overlap(queryTerms, terms(doc.title+" "+doc.source.URI+" "+doc.content)) == 0 {
+				continue
+			}
+			results = append(results, brainapi.MetadataResult{ID: string(tid) + ":metadata:" + strconv.Itoa(i), Title: doc.title, Kind: doc.source.MimeType, FreshAt: doc.freshAt})
 		}
-		results = append(results, brainapi.MetadataResult{ID: string(req.TenantID) + ":metadata:" + strconv.Itoa(i), Title: doc.title, Kind: doc.source.MimeType, FreshAt: doc.freshAt})
 	}
 	return brainapi.DiscoverResponse{Results: results}, nil
 }
@@ -640,6 +682,209 @@ func (c *Core) SetProjectState(ctx context.Context, tenantID brainapi.TenantID, 
 		return err
 	}
 	return nil
+}
+
+// ─── Shared knowledge tenant operations (brainapi.SharedKnowledgeCore) ───────
+
+// CreateSharedTenant provisions a shared knowledge tenant. It never creates a
+// binding-key entry, so the tenant is never resolvable via ResolveBinding.
+func (c *Core) CreateSharedTenant(ctx context.Context, req brainapi.CreateSharedTenantRequest) error {
+	_ = ctx
+	if err := brainapi.ValidateTenantID(req.TenantID); err != nil {
+		return err
+	}
+	if req.OwnerPrincipal.ID == "" {
+		return brainapi.E(brainapi.KindInvalid, "create_shared_tenant", "owner principal is required", nil)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.requireReadyLocked("create_shared_tenant"); err != nil {
+		return err
+	}
+	if _, ok := c.projects[req.TenantID]; ok {
+		return brainapi.E(brainapi.KindAlreadyExists, "create_shared_tenant", "tenant already exists", nil)
+	}
+	c.projects[req.TenantID] = project{
+		owner:     req.OwnerPrincipal,
+		metadata:  cloneMap(req.Metadata),
+		state:     brainapi.ProjectOn,
+		createdAt: c.now().UTC(),
+		tier:      brainapi.TierShared,
+	}
+	if err := c.persistLocked(); err != nil {
+		delete(c.projects, req.TenantID)
+		return err
+	}
+	return nil
+}
+
+// BindSharedTenant registers that queries/discovery scoped to
+// req.ProjectTenantID must also search req.SharedTenantID.
+func (c *Core) BindSharedTenant(ctx context.Context, req brainapi.BindSharedTenantRequest) error {
+	_ = ctx
+	if err := brainapi.ValidateTenantID(req.ProjectTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateTenantID(req.SharedTenantID); err != nil {
+		return err
+	}
+	if req.ProjectTenantID == req.SharedTenantID {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "project and shared tenant must differ", nil)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.requireReadyLocked("bind_shared_tenant"); err != nil {
+		return err
+	}
+	projTenant, ok := c.projects[req.ProjectTenantID]
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "bind_shared_tenant", "project tenant not found", nil)
+	}
+	if projTenant.isShared() {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "project tenant must not itself be a shared tenant", nil)
+	}
+	sharedTenant, ok := c.projects[req.SharedTenantID]
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "bind_shared_tenant", "shared tenant not found", nil)
+	}
+	if !sharedTenant.isShared() {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "target tenant was not created via CreateSharedTenant", nil)
+	}
+	if c.isBoundLocked(req.ProjectTenantID, req.SharedTenantID) {
+		return brainapi.E(brainapi.KindAlreadyExists, "bind_shared_tenant", "binding already exists", nil)
+	}
+	c.sharedBindings[req.ProjectTenantID] = append(c.sharedBindings[req.ProjectTenantID], req.SharedTenantID)
+	if err := c.persistLocked(); err != nil {
+		bound := c.sharedBindings[req.ProjectTenantID]
+		c.sharedBindings[req.ProjectTenantID] = bound[:len(bound)-1]
+		return err
+	}
+	return nil
+}
+
+// SharedBindings returns the shared tenant IDs currently bound to project, in
+// registration order. An unknown or unbound project returns an empty slice
+// and a nil error.
+func (c *Core) SharedBindings(ctx context.Context, project brainapi.TenantID) ([]brainapi.TenantID, error) {
+	_ = ctx
+	if err := brainapi.ValidateTenantID(project); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if err := c.requireReadyLocked("shared_bindings"); err != nil {
+		return nil, err
+	}
+	bound := c.sharedBindings[project]
+	out := make([]brainapi.TenantID, len(bound))
+	copy(out, bound)
+	return out, nil
+}
+
+// PromoteSource copies a single already-ingested project source into a shared
+// tenant bound to it. It is the only path that adds content to a shared
+// tenant; Ingest rejects any TenantID that names a shared tenant outright.
+func (c *Core) PromoteSource(ctx context.Context, req brainapi.PromoteRequest) error {
+	_ = ctx
+	if !req.Admin.HasRole("admin") {
+		return brainapi.E(brainapi.KindUnauthorized, "promote_source", "admin role is required", nil)
+	}
+	if err := brainapi.ValidateTenantID(req.ProjectTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateTenantID(req.SharedTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateSourceID(req.SourceID); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.requireReadyLocked("promote_source"); err != nil {
+		return err
+	}
+	projTenant, ok := c.projects[req.ProjectTenantID]
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "promote_source", "project tenant not found", nil)
+	}
+	if projTenant.isShared() {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "source tenant must be a project tenant", nil)
+	}
+	sharedTenant, ok := c.projects[req.SharedTenantID]
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "promote_source", "shared tenant not found", nil)
+	}
+	if !sharedTenant.isShared() {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "destination tenant is not a shared tenant", nil)
+	}
+	if !c.isBoundLocked(req.ProjectTenantID, req.SharedTenantID) {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "shared tenant is not bound to project tenant", nil)
+	}
+	doc, ok := c.findDocBySourceIDLocked(req.ProjectTenantID, req.SourceID)
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "promote_source", "source not found", nil)
+	}
+
+	sourcesBefore := len(c.sources[req.SharedTenantID])
+	docsBefore := len(c.docs[req.SharedTenantID])
+	chunksBefore := c.vectorStore.Len(req.SharedTenantID)
+
+	promoted := document{source: doc.source, title: doc.title, content: doc.content, freshAt: c.now().UTC()}
+	newChunks := chunksFrom(req.SharedTenantID, sourcesBefore, promoted, chunksBefore, c.embedder)
+	for i := range newChunks {
+		newChunks[i].Source.Tier = brainapi.TierShared
+	}
+	c.sources[req.SharedTenantID] = append(c.sources[req.SharedTenantID], promoted.source)
+	c.docs[req.SharedTenantID] = append(c.docs[req.SharedTenantID], promoted)
+	c.vectorStore.Add(req.SharedTenantID, newChunks)
+	if err := c.persistLocked(); err != nil {
+		c.sources[req.SharedTenantID] = c.sources[req.SharedTenantID][:sourcesBefore]
+		c.docs[req.SharedTenantID] = c.docs[req.SharedTenantID][:docsBefore]
+		c.vectorStore.TruncateTo(req.SharedTenantID, chunksBefore)
+		return err
+	}
+	return nil
+}
+
+// scopeTenantsLocked returns the tenant IDs to search for a Query/Discover
+// call scoped to project: project itself, followed by any shared tenants
+// bound to it (see BindSharedTenant) that still exist, are still tier-shared,
+// and are still ProjectOn. Must be called with c.mu held (read or write).
+func (c *Core) scopeTenantsLocked(project brainapi.TenantID) []brainapi.TenantID {
+	bound := c.sharedBindings[project]
+	scope := make([]brainapi.TenantID, 0, 1+len(bound))
+	scope = append(scope, project)
+	for _, sharedID := range bound {
+		shared, ok := c.projects[sharedID]
+		if !ok || !shared.isShared() || shared.state != brainapi.ProjectOn {
+			continue
+		}
+		scope = append(scope, sharedID)
+	}
+	return scope
+}
+
+// isBoundLocked reports whether shared is bound to project via
+// BindSharedTenant. Must be called with c.mu held.
+func (c *Core) isBoundLocked(project, shared brainapi.TenantID) bool {
+	for _, id := range c.sharedBindings[project] {
+		if id == shared {
+			return true
+		}
+	}
+	return false
+}
+
+// findDocBySourceIDLocked locates the document within tenantID whose
+// derived source ID (see AdminListSources) matches sourceID. Must be called
+// with c.mu held.
+func (c *Core) findDocBySourceIDLocked(tenantID brainapi.TenantID, sourceID string) (document, bool) {
+	for i, doc := range c.docs[tenantID] {
+		if string(tenantID)+":source:"+strconv.Itoa(i) == sourceID {
+			return doc, true
+		}
+	}
+	return document{}, false
 }
 
 // ─── Admin read operations ────────────────────────────────────────────────────
@@ -822,6 +1067,10 @@ func chunksFrom(tenantID brainapi.TenantID, sourceIndex int, doc document, offse
 				Title:    doc.title,
 				URI:      doc.source.URI,
 				TenantID: tenantID,
+				// Tier defaults to project: this is the tier for ordinary
+				// Ingest-created chunks. PromoteSource overrides it to
+				// TierShared on the copies it writes into a shared tenant.
+				Tier: brainapi.TierProject,
 			},
 			Text:    text,
 			Terms:   terms(text),

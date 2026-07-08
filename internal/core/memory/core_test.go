@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -972,6 +973,36 @@ func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "create shared tenant",
+			call: func() error {
+				return core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-a", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
+			},
+		},
+		{
+			name: "bind shared tenant",
+			call: func() error {
+				return core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "tenant-a", SharedTenantID: "shared-a"})
+			},
+		},
+		{
+			name: "shared bindings",
+			call: func() error {
+				_, err := core.SharedBindings(ctx, "tenant-a")
+				return err
+			},
+		},
+		{
+			name: "promote source",
+			call: func() error {
+				return core.PromoteSource(ctx, brainapi.PromoteRequest{
+					Admin:           brainapi.Principal{ID: "root", Roles: []string{"admin"}},
+					ProjectTenantID: "tenant-a",
+					SharedTenantID:  "shared-a",
+					SourceID:        "tenant-a:source:0",
+				})
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -984,5 +1015,413 @@ func TestCoreReturnsReadyErrorForServingAndMutationMethods(t *testing.T) {
 				t.Fatalf("ready error did not explain persistence failure: %v", err)
 			}
 		})
+	}
+}
+
+// ─── Shared knowledge tenant (#12) — validation and error-path coverage ─────
+//
+// coretest.RunContractSuite exercises the happy paths and the primary
+// contract-level rejections (unbound, direct-ingest, non-admin promote).
+// These tests fill in the remaining CreateSharedTenant/BindSharedTenant/
+// SharedBindings/PromoteSource branches (input validation, not-found,
+// invariant violations, and persist-failure rollback) that the black-box
+// suite does not reach because it only asserts contract-level guarantees.
+
+func TestCreateSharedTenantValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("invalid tenant id", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "bad id", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("missing owner principal", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-a"})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("already exists", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		req := brainapi.CreateSharedTenantRequest{TenantID: "shared-dup", OwnerPrincipal: brainapi.Principal{ID: "owner"}}
+		if err := core.CreateSharedTenant(ctx, req); err != nil {
+			t.Fatalf("first CreateSharedTenant: %v", err)
+		}
+		err := core.CreateSharedTenant(ctx, req)
+		if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("not resolvable via binding", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-nores", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		// A shared tenant never registers a BindingKey, so no key resolves to it.
+		if _, err := core.ResolveBinding(ctx, "api:space:NONE"); !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("unexpected resolvable binding: kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("persist failure rolls back", func(t *testing.T) {
+		t.Parallel()
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-rollback", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		if _, ok := core.projects["shared-rollback"]; ok {
+			t.Fatalf("tenant should not exist after rollback")
+		}
+	})
+}
+
+func TestBindSharedTenantValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	setup := func(t *testing.T) (core *Core, project, shared brainapi.TenantID) {
+		t.Helper()
+		c := New()
+		mustCreate(t, c, "bst-project", "api:space:BSTP")
+		if err := c.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "bst-shared", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		return c, "bst-project", "bst-shared"
+	}
+
+	t.Run("invalid project tenant id", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared := setup(t)
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "bad id", SharedTenantID: shared})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("invalid shared tenant id", func(t *testing.T) {
+		t.Parallel()
+		core, project, _ := setup(t)
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: project, SharedTenantID: "bad id"})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("self bind rejected", func(t *testing.T) {
+		t.Parallel()
+		core, project, _ := setup(t)
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: project, SharedTenantID: project})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project tenant not found", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared := setup(t)
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "bst-missing", SharedTenantID: shared})
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project tenant is itself shared", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared := setup(t)
+		if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "bst-shared-2", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant second: %v", err)
+		}
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "bst-shared-2", SharedTenantID: shared})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("shared tenant not found", func(t *testing.T) {
+		t.Parallel()
+		core, project, _ := setup(t)
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: project, SharedTenantID: "bst-missing-shared"})
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("target tenant is not a shared tenant", func(t *testing.T) {
+		t.Parallel()
+		core, project, _ := setup(t)
+		mustCreate(t, core, "bst-other-project", "api:space:BSTOP")
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: project, SharedTenantID: "bst-other-project"})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("persist failure rolls back", func(t *testing.T) {
+		t.Parallel()
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		mustCreate(t, core, "bst-rb-project", "api:space:BSTRB")
+		if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "bst-rb-shared", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "bst-rb-project", SharedTenantID: "bst-rb-shared"})
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		if bound := core.sharedBindings["bst-rb-project"]; len(bound) != 0 {
+			t.Fatalf("binding should be rolled back, got %+v", bound)
+		}
+	})
+}
+
+func TestSharedBindingsValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("invalid tenant id", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		_, err := core.SharedBindings(ctx, "bad id")
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+}
+
+func TestPromoteSourceValidation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	admin := brainapi.Principal{ID: "root", Roles: []string{"admin"}}
+
+	setup := func(t *testing.T) (core *Core, project, shared, sourceID string) {
+		t.Helper()
+		c := New()
+		mustCreate(t, c, "ps-project", "api:space:PSP")
+		if err := c.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "ps-shared", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		if err := c.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "ps-project", SharedTenantID: "ps-shared"}); err != nil {
+			t.Fatalf("BindSharedTenant: %v", err)
+		}
+		if err := c.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "ps-project", JobID: "ps-job",
+			Source:   brainapi.SourceRef{URI: "file://ps.txt", Name: "ps.txt"},
+			Metadata: map[string]string{"content": "promote source validation content"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		return c, "ps-project", "ps-shared", "ps-project:source:0"
+	}
+
+	t.Run("invalid project tenant id", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared, sourceID := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: "bad id", SharedTenantID: brainapi.TenantID(shared), SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("invalid shared tenant id", func(t *testing.T) {
+		t.Parallel()
+		core, project, _, sourceID := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: brainapi.TenantID(project), SharedTenantID: "bad id", SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("invalid source id", func(t *testing.T) {
+		t.Parallel()
+		core, project, shared, _ := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: brainapi.TenantID(project), SharedTenantID: brainapi.TenantID(shared), SourceID: ""})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project tenant not found", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared, sourceID := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: "ps-missing", SharedTenantID: brainapi.TenantID(shared), SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("project tenant is itself shared", func(t *testing.T) {
+		t.Parallel()
+		core, _, shared, sourceID := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: brainapi.TenantID(shared), SharedTenantID: brainapi.TenantID(shared), SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("shared tenant not found", func(t *testing.T) {
+		t.Parallel()
+		core, project, _, sourceID := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: brainapi.TenantID(project), SharedTenantID: "ps-missing-shared", SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("destination is not a shared tenant", func(t *testing.T) {
+		t.Parallel()
+		core, project, _, sourceID := setup(t)
+		mustCreate(t, core, "ps-other-project", "api:space:PSOP")
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: admin, ProjectTenantID: brainapi.TenantID(project), SharedTenantID: "ps-other-project", SourceID: sourceID})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("shared tenant not bound to project", func(t *testing.T) {
+		t.Parallel()
+		core := New()
+		mustCreate(t, core, "ps-nb-project", "api:space:PSNB")
+		if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "ps-nb-shared", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		// Deliberately no BindSharedTenant call.
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "ps-nb-project", JobID: "ps-nb-job",
+			Source: brainapi.SourceRef{URI: "file://nb.txt"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin: admin, ProjectTenantID: "ps-nb-project", SharedTenantID: "ps-nb-shared", SourceID: "ps-nb-project:source:0",
+		})
+		if !brainapi.IsKind(err, brainapi.KindInvalid) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("source not found", func(t *testing.T) {
+		t.Parallel()
+		core, project, shared, _ := setup(t)
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin: admin, ProjectTenantID: brainapi.TenantID(project), SharedTenantID: brainapi.TenantID(shared), SourceID: "ps-project:source:99",
+		})
+		if !brainapi.IsKind(err, brainapi.KindNotFound) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+	})
+
+	t.Run("persist failure rolls back", func(t *testing.T) {
+		t.Parallel()
+		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
+		mustCreate(t, core, "ps-rb-project", "api:space:PSRB")
+		if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "ps-rb-shared", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+			t.Fatalf("CreateSharedTenant: %v", err)
+		}
+		if err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "ps-rb-project", SharedTenantID: "ps-rb-shared"}); err != nil {
+			t.Fatalf("BindSharedTenant: %v", err)
+		}
+		if err := core.Ingest(ctx, brainapi.IngestRequest{
+			TenantID: "ps-rb-project", JobID: "ps-rb-job",
+			Source:   brainapi.SourceRef{URI: "file://rb.txt", Name: "rb.txt"},
+			Metadata: map[string]string{"content": "rollback promote content"},
+		}); err != nil {
+			t.Fatalf("Ingest: %v", err)
+		}
+
+		orig := marshalSnapshot
+		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
+		t.Cleanup(func() { marshalSnapshot = orig })
+
+		err := core.PromoteSource(ctx, brainapi.PromoteRequest{
+			Admin: admin, ProjectTenantID: "ps-rb-project", SharedTenantID: "ps-rb-shared", SourceID: "ps-rb-project:source:0",
+		})
+		if !brainapi.IsKind(err, brainapi.KindInternal) {
+			t.Fatalf("kind=%q err=%v", brainapi.KindOf(err), err)
+		}
+		if got := len(core.sources["ps-rb-shared"]); got != 0 {
+			t.Fatalf("sources should be rolled back, got %d", got)
+		}
+		if got := len(core.docs["ps-rb-shared"]); got != 0 {
+			t.Fatalf("docs should be rolled back, got %d", got)
+		}
+		if got := core.vectorStore.Len("ps-rb-shared"); got != 0 {
+			t.Fatalf("chunks should be rolled back, got %d", got)
+		}
+	})
+}
+
+// TestScopeTenantsLockedExcludesStaleSharedBindings is a white-box test of the
+// defensive branches in scopeTenantsLocked: a bound shared-tenant ID that no
+// longer exists, that is no longer tier-shared, or that has been turned off
+// must all be silently excluded from scope rather than erroring the whole
+// query. These states are not reachable through the public API (BindSharedTenant
+// always validates existence and tier), so they are exercised here by
+// manipulating internal state directly.
+func TestScopeTenantsLockedExcludesStaleSharedBindings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	core := New()
+	mustCreate(t, core, "scope-project", "api:space:SCOPE")
+	if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "scope-shared-off", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+		t.Fatalf("CreateSharedTenant off: %v", err)
+	}
+	if err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "scope-project", SharedTenantID: "scope-shared-off"}); err != nil {
+		t.Fatalf("BindSharedTenant off: %v", err)
+	}
+	if err := core.SetProjectState(ctx, "scope-shared-off", brainapi.ProjectOff); err != nil {
+		t.Fatalf("SetProjectState off: %v", err)
+	}
+
+	// Directly append two additional stale bindings that BindSharedTenant
+	// could never produce: one pointing at a tenant ID that does not exist at
+	// all, and one pointing at an ordinary (non-shared) project tenant.
+	mustCreate(t, core, "scope-not-shared", "api:space:SCOPENS")
+	core.mu.Lock()
+	core.sharedBindings["scope-project"] = append(core.sharedBindings["scope-project"], "scope-missing", "scope-not-shared")
+	core.mu.Unlock()
+
+	scope := func() []brainapi.TenantID {
+		core.mu.RLock()
+		defer core.mu.RUnlock()
+		return core.scopeTenantsLocked("scope-project")
+	}()
+
+	if len(scope) != 1 || scope[0] != "scope-project" {
+		t.Fatalf("scope should only contain the project tenant itself, got %+v", scope)
+	}
+}
+
+// TestFindDocBySourceIDLockedNotFound covers the not-found branch of
+// findDocBySourceIDLocked directly (also reached indirectly via PromoteSource's
+// "source not found" test, but exercised here in isolation for clarity).
+func TestFindDocBySourceIDLockedNotFound(t *testing.T) {
+	t.Parallel()
+	core := New()
+	mustCreate(t, core, "find-doc-tenant", "api:space:FINDDOC")
+	core.mu.RLock()
+	_, ok := core.findDocBySourceIDLocked("find-doc-tenant", "find-doc-tenant:source:0")
+	core.mu.RUnlock()
+	if ok {
+		t.Fatalf("expected not found for empty tenant")
 	}
 }

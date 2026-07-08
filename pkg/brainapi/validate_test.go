@@ -61,6 +61,9 @@ func TestValidateTenantAndJobID(t *testing.T) {
 		{"job valid", func() error { return ValidateJobID("job-a") }, true},
 		{"job blank", func() error { return ValidateJobID("") }, false},
 		{"job tab", func() error { return ValidateJobID("job\ta") }, false},
+		{"source id valid", func() error { return ValidateSourceID("tenant-a:source:0") }, true},
+		{"source id blank", func() error { return ValidateSourceID("") }, false},
+		{"source id whitespace only", func() error { return ValidateSourceID("   ") }, false},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
