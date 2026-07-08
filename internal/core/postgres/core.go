@@ -92,6 +92,13 @@ func (c *Core) Close() {
 	c.pool.Close()
 }
 
+// Compile-time interface checks: Core must satisfy both the base contract and
+// the optional shared-knowledge-tenant extension (#12).
+var (
+	_ brainapi.Core                = (*Core)(nil)
+	_ brainapi.SharedKnowledgeCore = (*Core)(nil)
+)
+
 // ─── brainapi.Core implementation ────────────────────────────────────────────
 
 // ResolveBinding returns the TenantID for a surface-neutral binding key.
@@ -218,12 +225,15 @@ func (c *Core) Ingest(ctx context.Context, req brainapi.IngestRequest) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	// Verify tenant exists and is on (RLS enforces visibility).
-	state, err := fetchProjectState(ctx, tx, req.TenantID)
+	tier, state, err := fetchTenantTierState(ctx, tx, req.TenantID, "ingest")
 	if err != nil {
 		return err
 	}
 	if state == string(brainapi.ProjectOff) {
 		return brainapi.E(brainapi.KindConflict, "ingest", "project is off", nil)
+	}
+	if tier == string(brainapi.TierShared) {
+		return brainapi.E(brainapi.KindUnauthorized, "ingest", "direct ingest into a shared tenant is not allowed; use SharedKnowledgeCore.PromoteSource", nil)
 	}
 
 	// Insert job — unique constraint catches duplicates.
@@ -349,7 +359,7 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	}
 
 	// Verify project exists and is on.
-	state, err := fetchProjectStateFromPool(ctx, conn.Conn(), req.TenantID)
+	_, state, err := fetchTenantTierState(ctx, conn.Conn(), req.TenantID, "query")
 	if err != nil {
 		return brainapi.QueryResponse{}, err
 	}
@@ -357,10 +367,21 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 		return brainapi.QueryResponse{}, brainapi.E(brainapi.KindConflict, "query", "project is off", nil)
 	}
 
+	// Scope is [req.TenantID] ∪ [shared tenants bound to req.TenantID that
+	// still exist, are tier=shared, and are ProjectOn] (see scopeTenantIDs and
+	// brainapi.SharedKnowledgeCore). Candidates from every tenant in scope are
+	// merged before ranking so relevance treats project and bound-shared
+	// content as one pool; strict isolation is preserved because scope never
+	// includes another project tenant or an unbound/off/missing shared tenant.
+	scope, err := scopeTenantIDs(ctx, conn.Conn(), req.TenantID)
+	if err != nil {
+		return brainapi.QueryResponse{}, wrapInternal("query", err)
+	}
+
 	rows, err := conn.Query(ctx,
-		`SELECT id, source_id, source_uri, source_title, text, kind, fresh_at
-		 FROM chunks WHERE tenant_id = $1`,
-		string(req.TenantID),
+		`SELECT id, tenant_id, source_id, source_uri, source_title, text, kind, fresh_at
+		 FROM chunks WHERE tenant_id = ANY($1)`,
+		scope,
 	)
 	if err != nil {
 		return brainapi.QueryResponse{}, wrapInternal("query", err)
@@ -369,6 +390,7 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 
 	type dbChunk struct {
 		id          string
+		tenantID    string
 		sourceID    int64
 		sourceURI   string
 		sourceTitle string
@@ -380,7 +402,7 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	var dbChunks []dbChunk
 	for rows.Next() {
 		var ch dbChunk
-		if err := rows.Scan(&ch.id, &ch.sourceID, &ch.sourceURI, &ch.sourceTitle, &ch.text, &ch.kind, &ch.freshAt); err != nil {
+		if err := rows.Scan(&ch.id, &ch.tenantID, &ch.sourceID, &ch.sourceURI, &ch.sourceTitle, &ch.text, &ch.kind, &ch.freshAt); err != nil {
 			return brainapi.QueryResponse{}, wrapInternal("query", err)
 		}
 		dbChunks = append(dbChunks, ch)
@@ -421,7 +443,11 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 	}
 	top := scores[:limit]
 
-	// Build response.
+	// Build response. Sources report the tenant that actually owns the chunk
+	// (which may be a bound shared tenant, not req.TenantID) and the
+	// corresponding Tier: TierProject for req.TenantID's own content,
+	// TierShared for content contributed by a bound shared tenant (see
+	// brainapi.Tier and SharedKnowledgeCore.PromoteSource).
 	seenSrc := make(map[string]bool)
 	sources := make([]brainapi.Source, 0, limit)
 	spans := make([]string, 0, limit)
@@ -429,11 +455,16 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 		srcKey := strconv.FormatInt(r.ch.sourceID, 10)
 		if !seenSrc[srcKey] {
 			seenSrc[srcKey] = true
+			tier := brainapi.TierProject
+			if r.ch.tenantID != string(req.TenantID) {
+				tier = brainapi.TierShared
+			}
 			sources = append(sources, brainapi.Source{
-				ID:       string(req.TenantID) + ":source:" + srcKey,
+				ID:       r.ch.tenantID + ":source:" + srcKey,
 				Title:    r.ch.sourceTitle,
 				URI:      r.ch.sourceURI,
-				TenantID: req.TenantID,
+				TenantID: brainapi.TenantID(r.ch.tenantID),
+				Tier:     tier,
 			})
 		}
 		spans = append(spans, r.ch.text)
@@ -464,7 +495,7 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 	}
 
 	// Verify project exists and is on.
-	state, err := fetchProjectStateFromPool(ctx, conn.Conn(), req.TenantID)
+	_, state, err := fetchTenantTierState(ctx, conn.Conn(), req.TenantID, "discover")
 	if err != nil {
 		return brainapi.DiscoverResponse{}, err
 	}
@@ -472,9 +503,16 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 		return brainapi.DiscoverResponse{}, brainapi.E(brainapi.KindConflict, "discover", "project is off", nil)
 	}
 
+	// Scope is [req.TenantID] ∪ [bound, existing, on shared tenants]; see
+	// scopeTenantIDs and the Query method above for the same computation.
+	scope, err := scopeTenantIDs(ctx, conn.Conn(), req.TenantID)
+	if err != nil {
+		return brainapi.DiscoverResponse{}, wrapInternal("discover", err)
+	}
+
 	rows, err := conn.Query(ctx,
-		`SELECT id, name, mime_type, created_at FROM sources WHERE tenant_id = $1 ORDER BY id`,
-		string(req.TenantID),
+		`SELECT id, tenant_id, name, mime_type, created_at FROM sources WHERE tenant_id = ANY($1) ORDER BY id`,
+		scope,
 	)
 	if err != nil {
 		return brainapi.DiscoverResponse{}, wrapInternal("discover", err)
@@ -484,6 +522,7 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 	// additional queries (pgx does not allow two active result sets on one conn).
 	type srcRow struct {
 		id        int64
+		tenantID  string
 		name      string
 		mimeType  string
 		createdAt time.Time
@@ -491,7 +530,7 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 	var srcs []srcRow
 	for rows.Next() {
 		var r srcRow
-		if err := rows.Scan(&r.id, &r.name, &r.mimeType, &r.createdAt); err != nil {
+		if err := rows.Scan(&r.id, &r.tenantID, &r.name, &r.mimeType, &r.createdAt); err != nil {
 			rows.Close()
 			return brainapi.DiscoverResponse{}, wrapInternal("discover", err)
 		}
@@ -509,13 +548,13 @@ func (c *Core) Discover(ctx context.Context, req brainapi.DiscoverRequest) (brai
 		if len(queryTerms) > 0 {
 			docTerms := termFreq(r.name)
 			if overlap(queryTerms, docTerms) == 0 {
-				if !matchesChunkContent(ctx, conn.Conn(), req.TenantID, r.id, queryTerms) {
+				if !matchesChunkContent(ctx, conn.Conn(), brainapi.TenantID(r.tenantID), r.id, queryTerms) {
 					continue
 				}
 			}
 		}
 		results = append(results, brainapi.MetadataResult{
-			ID:      string(req.TenantID) + ":metadata:" + strconv.FormatInt(r.id, 10),
+			ID:      r.tenantID + ":metadata:" + strconv.FormatInt(r.id, 10),
 			Title:   r.name,
 			Kind:    r.mimeType,
 			FreshAt: r.createdAt,
@@ -556,6 +595,284 @@ func (c *Core) SetProjectState(ctx context.Context, tenantID brainapi.TenantID, 
 		return brainapi.E(brainapi.KindNotFound, "set_project_state", "tenant not found", nil)
 	}
 	return nil
+}
+
+// ─── Shared knowledge tenant operations (brainapi.SharedKnowledgeCore) ───────
+
+// CreateSharedTenant provisions a shared knowledge tenant. It never creates a
+// bindings row, so the tenant is never resolvable via ResolveBinding.
+func (c *Core) CreateSharedTenant(ctx context.Context, req brainapi.CreateSharedTenantRequest) error {
+	if err := brainapi.ValidateTenantID(req.TenantID); err != nil {
+		return err
+	}
+	if req.OwnerPrincipal.ID == "" {
+		return brainapi.E(brainapi.KindInvalid, "create_shared_tenant", "owner principal is required", nil)
+	}
+
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return wrapInternal("create_shared_tenant", err)
+	}
+	defer conn.Release()
+
+	// Admin GUC lets RLS pass for the insert and any subsequent duplicate check.
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return wrapInternal("create_shared_tenant", err)
+	}
+
+	roles := req.OwnerPrincipal.Roles
+	if roles == nil {
+		roles = []string{}
+	}
+	metadata := marshalMetadata(req.Metadata)
+
+	_, err = conn.Exec(ctx,
+		`INSERT INTO tenants (tenant_id, owner_source, owner_id, owner_roles, metadata, state, tier)
+		 VALUES ($1, $2, $3, $4, $5, 'on', 'shared')`,
+		string(req.TenantID),
+		req.OwnerPrincipal.Source,
+		req.OwnerPrincipal.ID,
+		roles,
+		metadata,
+	)
+	if err != nil {
+		if isPGUniqueViolation(err) {
+			return brainapi.E(brainapi.KindAlreadyExists, "create_shared_tenant", "tenant already exists", nil)
+		}
+		return wrapInternal("create_shared_tenant", err)
+	}
+	return nil
+}
+
+// BindSharedTenant registers that queries/discovery scoped to
+// req.ProjectTenantID must also search req.SharedTenantID.
+func (c *Core) BindSharedTenant(ctx context.Context, req brainapi.BindSharedTenantRequest) error {
+	if err := brainapi.ValidateTenantID(req.ProjectTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateTenantID(req.SharedTenantID); err != nil {
+		return err
+	}
+	if req.ProjectTenantID == req.SharedTenantID {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "project and shared tenant must differ", nil)
+	}
+
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return wrapInternal("bind_shared_tenant", err)
+	}
+	defer conn.Release()
+
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return wrapInternal("bind_shared_tenant", err)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return wrapInternal("bind_shared_tenant", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	projTier, _, err := fetchTenantTierState(ctx, tx, req.ProjectTenantID, "bind_shared_tenant")
+	if err != nil {
+		return err
+	}
+	if projTier == string(brainapi.TierShared) {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "project tenant must not itself be a shared tenant", nil)
+	}
+	sharedTier, _, err := fetchTenantTierState(ctx, tx, req.SharedTenantID, "bind_shared_tenant")
+	if err != nil {
+		return err
+	}
+	if sharedTier != string(brainapi.TierShared) {
+		return brainapi.E(brainapi.KindInvalid, "bind_shared_tenant", "target tenant was not created via CreateSharedTenant", nil)
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO shared_bindings (project_tenant_id, shared_tenant_id) VALUES ($1, $2)`,
+		string(req.ProjectTenantID), string(req.SharedTenantID),
+	)
+	if err != nil {
+		if isPGUniqueViolation(err) {
+			return brainapi.E(brainapi.KindAlreadyExists, "bind_shared_tenant", "binding already exists", nil)
+		}
+		return wrapInternal("bind_shared_tenant", err)
+	}
+
+	return mapErr("bind_shared_tenant", tx.Commit(ctx))
+}
+
+// SharedBindings returns the shared tenant IDs currently bound to project, in
+// registration order. An unknown or unbound project returns an empty slice
+// and a nil error — this is never treated as an error condition.
+func (c *Core) SharedBindings(ctx context.Context, project brainapi.TenantID) ([]brainapi.TenantID, error) {
+	if err := brainapi.ValidateTenantID(project); err != nil {
+		return nil, err
+	}
+
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return nil, wrapInternal("shared_bindings", err)
+	}
+	defer conn.Release()
+
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return nil, wrapInternal("shared_bindings", err)
+	}
+
+	rows, err := conn.Query(ctx,
+		`SELECT shared_tenant_id FROM shared_bindings WHERE project_tenant_id = $1 ORDER BY created_at`,
+		string(project),
+	)
+	if err != nil {
+		return nil, wrapInternal("shared_bindings", err)
+	}
+	defer rows.Close()
+
+	var out []brainapi.TenantID
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, wrapInternal("shared_bindings", err)
+		}
+		out = append(out, brainapi.TenantID(id))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapInternal("shared_bindings", err)
+	}
+	return out, nil
+}
+
+// PromoteSource copies a single already-ingested project source into a shared
+// tenant bound to it. It is the only path that adds content to a shared
+// tenant; Ingest rejects any TenantID that names a shared tenant outright.
+//
+// The copy takes the already-chunked text from the origin source's chunks
+// (rather than re-deriving and re-chunking raw content, which postgres does
+// not store separately from its chunks) and writes it under a new source row
+// owned by req.SharedTenantID, preserving the URI/name/MIME metadata.
+func (c *Core) PromoteSource(ctx context.Context, req brainapi.PromoteRequest) error {
+	if !req.Admin.HasRole("admin") {
+		return brainapi.E(brainapi.KindUnauthorized, "promote_source", "admin role is required", nil)
+	}
+	if err := brainapi.ValidateTenantID(req.ProjectTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateTenantID(req.SharedTenantID); err != nil {
+		return err
+	}
+	if err := brainapi.ValidateSourceID(req.SourceID); err != nil {
+		return err
+	}
+
+	conn, err := c.acquire(ctx)
+	if err != nil {
+		return wrapInternal("promote_source", err)
+	}
+	defer conn.Release()
+
+	// The whole operation runs under the admin GUC sentinel: it must read the
+	// origin project tenant's source/chunks and write into the (different)
+	// shared tenant's source/chunks within one transaction.
+	if err := setAdminGUC(ctx, conn.Conn()); err != nil {
+		return wrapInternal("promote_source", err)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return wrapInternal("promote_source", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	projTier, _, err := fetchTenantTierState(ctx, tx, req.ProjectTenantID, "promote_source")
+	if err != nil {
+		return err
+	}
+	if projTier == string(brainapi.TierShared) {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "source tenant must be a project tenant", nil)
+	}
+	sharedTier, _, err := fetchTenantTierState(ctx, tx, req.SharedTenantID, "promote_source")
+	if err != nil {
+		return err
+	}
+	if sharedTier != string(brainapi.TierShared) {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "destination tenant is not a shared tenant", nil)
+	}
+
+	var bound bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM shared_bindings WHERE project_tenant_id = $1 AND shared_tenant_id = $2)`,
+		string(req.ProjectTenantID), string(req.SharedTenantID),
+	).Scan(&bound); err != nil {
+		return wrapInternal("promote_source", err)
+	}
+	if !bound {
+		return brainapi.E(brainapi.KindInvalid, "promote_source", "shared tenant is not bound to project tenant", nil)
+	}
+
+	sourceRowID, ok := parseSourceID(req.SourceID, req.ProjectTenantID)
+	if !ok {
+		return brainapi.E(brainapi.KindNotFound, "promote_source", "source not found", nil)
+	}
+
+	var uri, mimeType, name string
+	err = tx.QueryRow(ctx,
+		`SELECT uri, mime_type, name FROM sources WHERE id = $1 AND tenant_id = $2`,
+		sourceRowID, string(req.ProjectTenantID),
+	).Scan(&uri, &mimeType, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return brainapi.E(brainapi.KindNotFound, "promote_source", "source not found", nil)
+	}
+	if err != nil {
+		return wrapInternal("promote_source", err)
+	}
+
+	type origChunk struct{ text, kind string }
+	rows, err := tx.Query(ctx,
+		`SELECT text, kind FROM chunks WHERE tenant_id = $1 AND source_id = $2 ORDER BY id`,
+		string(req.ProjectTenantID), sourceRowID,
+	)
+	if err != nil {
+		return wrapInternal("promote_source", err)
+	}
+	var origChunks []origChunk
+	for rows.Next() {
+		var ch origChunk
+		if err := rows.Scan(&ch.text, &ch.kind); err != nil {
+			rows.Close()
+			return wrapInternal("promote_source", err)
+		}
+		origChunks = append(origChunks, ch)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return wrapInternal("promote_source", err)
+	}
+	rows.Close()
+
+	freshAt := c.now().UTC()
+	var newSourceID int64
+	if err := tx.QueryRow(ctx,
+		`INSERT INTO sources (tenant_id, uri, mime_type, name) VALUES ($1, $2, $3, $4) RETURNING id`,
+		string(req.SharedTenantID), uri, mimeType, name,
+	).Scan(&newSourceID); err != nil {
+		return wrapInternal("promote_source", err)
+	}
+
+	srcKey := strconv.FormatInt(newSourceID, 10)
+	for i, ch := range origChunks {
+		id := string(req.SharedTenantID) + ":chunk:" + srcKey + ":" + strconv.Itoa(i)
+		_, err = tx.Exec(ctx,
+			`INSERT INTO chunks (id, tenant_id, source_id, source_uri, source_title, text, kind, fresh_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			id, string(req.SharedTenantID), newSourceID, uri, name, ch.text, ch.kind, freshAt,
+		)
+		if err != nil {
+			return fmt.Errorf("postgres promote_source: insert chunk %d: %w", i, wrapInternal("promote_source", err))
+		}
+	}
+
+	return mapErr("promote_source", tx.Commit(ctx))
 }
 
 // ─── Admin read operations ────────────────────────────────────────────────────
@@ -799,35 +1116,77 @@ func escapeSQLString(s string) string {
 
 // ─── Project state helpers ────────────────────────────────────────────────────
 
-// fetchProjectState queries the tenant state inside a transaction.
-// Returns KindNotFound if the tenant does not exist.
-func fetchProjectState(ctx context.Context, tx pgx.Tx, tenantID brainapi.TenantID) (string, error) {
-	var state string
-	err := tx.QueryRow(ctx,
-		`SELECT state FROM tenants WHERE tenant_id = $1`, string(tenantID),
-	).Scan(&state)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", brainapi.E(brainapi.KindNotFound, "ingest", "tenant not found", nil)
-	}
-	if err != nil {
-		return "", wrapInternal("ingest", err)
-	}
-	return state, nil
+// rowQuerier is satisfied by both *pgx.Conn and pgx.Tx, letting
+// fetchTenantTierState run inside or outside an explicit transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// fetchProjectStateFromPool queries tenant state directly on a *pgx.Conn.
-func fetchProjectStateFromPool(ctx context.Context, conn *pgx.Conn, tenantID brainapi.TenantID) (string, error) {
-	var state string
-	err := conn.QueryRow(ctx,
-		`SELECT state FROM tenants WHERE tenant_id = $1`, string(tenantID),
-	).Scan(&state)
+// fetchTenantTierState queries tenant tier and state for tenantID.
+// Returns KindNotFound (tagged with op) if the tenant does not exist.
+func fetchTenantTierState(ctx context.Context, q rowQuerier, tenantID brainapi.TenantID, op string) (tier, state string, err error) {
+	err = q.QueryRow(ctx,
+		`SELECT tier, state FROM tenants WHERE tenant_id = $1`, string(tenantID),
+	).Scan(&tier, &state)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", brainapi.E(brainapi.KindNotFound, "query", "tenant not found", nil)
+		return "", "", brainapi.E(brainapi.KindNotFound, op, "tenant not found", nil)
 	}
 	if err != nil {
-		return "", wrapInternal("query", err)
+		return "", "", wrapInternal(op, err)
 	}
-	return state, nil
+	return tier, state, nil
+}
+
+// ─── Shared knowledge tenant scope (#12) ──────────────────────────────────────
+
+// scopeTenantIDs returns the tenant IDs to search for a Query/Discover call
+// scoped to project: project itself, followed by any shared tenants bound to
+// it (see BindSharedTenant) that still exist, are still tier='shared', and
+// are still ProjectOn. It mirrors internal/core/memory.Core.scopeTenantsLocked
+// and the RLS policies added in migrations/002_shared_tenants.sql.
+func scopeTenantIDs(ctx context.Context, conn *pgx.Conn, project brainapi.TenantID) ([]string, error) {
+	rows, err := conn.Query(ctx,
+		`SELECT sb.shared_tenant_id
+		 FROM shared_bindings sb
+		 JOIN tenants st ON st.tenant_id = sb.shared_tenant_id
+		 WHERE sb.project_tenant_id = $1
+		   AND st.tier = 'shared'
+		   AND st.state = 'on'`,
+		string(project),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	scope := []string{string(project)}
+	for rows.Next() {
+		var sharedID string
+		if err := rows.Scan(&sharedID); err != nil {
+			return nil, err
+		}
+		scope = append(scope, sharedID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return scope, nil
+}
+
+// parseSourceID extracts the numeric sources.id from a SourceInfo.ID string of
+// the form "{tenantID}:source:{id}" (see AdminListSources / PromoteRequest),
+// verifying that the tenant prefix matches tenantID. It returns ok=false for
+// any malformed or tenant-mismatched input.
+func parseSourceID(sourceID string, tenantID brainapi.TenantID) (int64, bool) {
+	prefix := string(tenantID) + ":source:"
+	if !strings.HasPrefix(sourceID, prefix) {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(strings.TrimPrefix(sourceID, prefix), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 // matchesChunkContent checks whether any chunk for sourceID contains any of queryTerms.
