@@ -34,6 +34,44 @@ func TestHandlerDispatchesTrustedJSONCommand(t *testing.T) {
 	}
 }
 
+func TestHandlerAskExposesSourcesAndGroundingAvailable(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{
+		answer:             "api answer",
+		sources:            []brainapi.Source{{ID: "s1", Title: "Doc One", URI: "https://example.com/doc1", TenantID: "tenant-1"}},
+		groundingAvailable: true,
+	}
+	h := NewHandler(gw, "token")
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1"},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response commandResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !response.GroundingAvailable || len(response.Sources) != 1 || response.Sources[0].Title != "Doc One" {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
+func TestHandlerAskOmitsSourcesWhenUngrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{answer: "수집된 근거가 없습니다: hello", groundingAvailable: false}
+	h := NewHandler(gw, "token")
+	rec := perform(t, h, http.MethodPost, `{"binding_key":"web:space:S1","principal":{"source":"web","id":"U1"},"text":"ask hello"}`, "token")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response commandResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if response.GroundingAvailable || len(response.Sources) != 0 {
+		t.Fatalf("response=%+v", response)
+	}
+}
+
 func TestHandlerDispatchesAdminCommand(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{}
@@ -136,10 +174,12 @@ func perform(t *testing.T, h *Handler, method, body, token string) *httptest.Res
 }
 
 type fakeGateway struct {
-	asked        gateway.AskCommand
-	projectState gateway.SetProjectStateCommand
-	answer       string
-	err          error
+	asked              gateway.AskCommand
+	projectState       gateway.SetProjectStateCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	err                error
 }
 
 func (f *fakeGateway) CreateProject(context.Context, gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
@@ -154,7 +194,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if f.err != nil {
 		return brainapi.QueryResponse{}, f.err
 	}
-	return brainapi.QueryResponse{Answer: f.answer}, nil
+	return brainapi.QueryResponse{Answer: f.answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(context.Context, gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {

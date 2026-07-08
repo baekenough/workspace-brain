@@ -53,7 +53,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, statusFor(err), errorResponse{Error: frontend.SafeMessage(err)})
 		return
 	}
-	writeJSON(w, http.StatusOK, commandResponse{Visibility: response.Visibility, Text: response.Text})
+	writeJSON(w, http.StatusOK, commandResponse{
+		Visibility:         response.Visibility,
+		Text:               response.Text,
+		Sources:            response.Sources,
+		GroundingAvailable: response.GroundingAvailable,
+	})
 }
 
 func (h *Handler) authorized(r *http.Request) bool {
@@ -75,6 +80,12 @@ type commandRequest struct {
 type commandResponse struct {
 	Visibility frontend.Visibility `json:"visibility"`
 	Text       string              `json:"text"`
+	// Sources lists grounded citations for "ask" answers. Omitted (empty)
+	// for non-ask commands and for ungrounded ("모른다") answers.
+	Sources []brainapi.Source `json:"sources,omitempty"`
+	// GroundingAvailable reports whether the underlying query found grounded
+	// evidence backing Sources.
+	GroundingAvailable bool `json:"grounding_available,omitempty"`
 }
 
 type errorResponse struct {

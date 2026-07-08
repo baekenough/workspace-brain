@@ -48,6 +48,13 @@ type Request struct {
 type Response struct {
 	Visibility Visibility
 	Text       string
+	// Sources lists the grounded citations backing Text. It is populated only
+	// for "ask" responses that found grounded evidence; it is empty for every
+	// other command and for ungrounded ("모른다") answers.
+	Sources []brainapi.Source
+	// GroundingAvailable reports whether the underlying query found grounded
+	// evidence. Adapters must not render a citation list when this is false.
+	GroundingAvailable bool
 }
 
 // Dispatcher routes normalized frontend commands to gateway methods.
@@ -95,7 +102,10 @@ func (d *Dispatcher) Handle(ctx context.Context, req Request) (Response, error) 
 		if err != nil {
 			return Response{}, err
 		}
-		return private(answer.Answer), nil
+		res := private(answer.Answer)
+		res.Sources = answer.Sources
+		res.GroundingAvailable = answer.GroundingAvailable
+		return res, nil
 	case "discover":
 		result, err := d.gateway.Discover(ctx, gateway.DiscoverCommand{BindingKey: req.BindingKey, Principal: req.Principal, Query: args})
 		if err != nil {
@@ -228,4 +238,32 @@ func SafeMessage(err error) string {
 
 func private(text string) Response {
 	return Response{Visibility: VisibilityPrivate, Text: text}
+}
+
+// FormatCitations renders a numbered citation list suitable for appending
+// after an answer's text. It returns an empty string when there are no
+// sources to cite, so callers can safely append the result unconditionally
+// (e.g. ungrounded "모른다" answers are left untouched).
+func FormatCitations(sources []brainapi.Source) string {
+	if len(sources) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n\n출처:")
+	for i, s := range sources {
+		label := s.Title
+		if label == "" {
+			label = s.URI
+		}
+		b.WriteString("\n")
+		b.WriteString(strconv.Itoa(i + 1))
+		b.WriteString(". ")
+		b.WriteString(label)
+		if s.URI != "" && s.URI != label {
+			b.WriteString(" (")
+			b.WriteString(s.URI)
+			b.WriteString(")")
+		}
+	}
+	return b.String()
 }

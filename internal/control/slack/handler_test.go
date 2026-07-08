@@ -63,6 +63,38 @@ func TestHandlerAskReturnsEphemeralAnswer(t *testing.T) {
 	assertTextContains(t, rec.Body.String(), "근거 기반 답변")
 }
 
+func TestHandlerAskRendersCitationsWhenGrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{
+		answer:             "근거 기반 답변",
+		sources:            []brainapi.Source{{Title: "Doc One", URI: "https://example.com/doc1"}},
+		groundingAvailable: true,
+	}
+	h := NewHandler(gw, "secret", nil)
+	h.Now = fixedNow
+	rec := perform(t, h, "ask 질문")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertTextContains(t, rec.Body.String(), "근거 기반 답변")
+	assertTextContains(t, rec.Body.String(), "출처:")
+	assertTextContains(t, rec.Body.String(), "Doc One (https://example.com/doc1)")
+}
+
+func TestHandlerAskOmitsCitationsWhenUngrounded(t *testing.T) {
+	t.Parallel()
+	gw := &fakeGateway{answer: "수집된 근거가 없습니다: 질문", groundingAvailable: false}
+	h := NewHandler(gw, "secret", nil)
+	h.Now = fixedNow
+	rec := perform(t, h, "ask 질문")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "출처:") {
+		t.Fatalf("expected no citation list for ungrounded answer, body=%s", rec.Body.String())
+	}
+}
+
 func TestHandlerIngestAndStatus(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{jobStatus: brainapi.JobCompleted}
@@ -157,14 +189,16 @@ func assertTextContains(t *testing.T, body, want string) {
 }
 
 type fakeGateway struct {
-	created    gateway.CreateProjectCommand
-	asked      gateway.AskCommand
-	discovered gateway.DiscoverCommand
-	ingested   gateway.IngestCommand
-	status     gateway.StatusCommand
-	answer     string
-	jobStatus  brainapi.JobStatus
-	err        error
+	created            gateway.CreateProjectCommand
+	asked              gateway.AskCommand
+	discovered         gateway.DiscoverCommand
+	ingested           gateway.IngestCommand
+	status             gateway.StatusCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	jobStatus          brainapi.JobStatus
+	err                error
 }
 
 func (f *fakeGateway) CreateProject(_ context.Context, cmd gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
@@ -184,7 +218,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if answer == "" {
 		answer = "ok"
 	}
-	return brainapi.QueryResponse{Answer: answer}, nil
+	return brainapi.QueryResponse{Answer: answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(_ context.Context, cmd gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {
@@ -363,6 +397,15 @@ func TestRenderMapsVisibilityToSlackResponseType(t *testing.T) {
 	got = render(frontend.Response{Text: "broadcast"})
 	if got.ResponseType != "in_channel" || got.Text != "broadcast" {
 		t.Fatalf("default (empty visibility): %+v", got)
+	}
+
+	got = render(frontend.Response{
+		Visibility: frontend.VisibilityPrivate,
+		Text:       "grounded",
+		Sources:    []brainapi.Source{{Title: "Doc", URI: "https://example.com/d"}},
+	})
+	if got.Text != "grounded"+frontend.FormatCitations([]brainapi.Source{{Title: "Doc", URI: "https://example.com/d"}}) {
+		t.Fatalf("with sources: %+v", got)
 	}
 }
 

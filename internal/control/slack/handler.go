@@ -162,10 +162,11 @@ func ephemeral(text string) slackResponse {
 }
 
 func render(response frontend.Response) slackResponse {
+	text := response.Text + frontend.FormatCitations(response.Sources)
 	if response.Visibility == frontend.VisibilityPrivate {
-		return ephemeral(response.Text)
+		return ephemeral(text)
 	}
-	return slackResponse{ResponseType: "in_channel", Text: response.Text}
+	return slackResponse{ResponseType: "in_channel", Text: text}
 }
 
 func safeMessage(err error) string {

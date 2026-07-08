@@ -44,6 +44,59 @@ func TestDispatcherUsesSurfaceNeutralEnvelope(t *testing.T) {
 	}
 }
 
+// TestDispatcherAskExposesProvenance verifies that grounded citations and the
+// GroundingAvailable flag survive the trip from the gateway answer to the
+// surface-neutral envelope, and that ungrounded ("모른다") answers carry no
+// provenance.
+func TestDispatcherAskExposesProvenance(t *testing.T) {
+	t.Parallel()
+	sources := []brainapi.Source{
+		{ID: "s1", Title: "Doc One", URI: "https://example.com/doc1", TenantID: "tenant-1"},
+		{ID: "s2", Title: "Doc Two", URI: "https://example.com/doc2", TenantID: "tenant-1"},
+	}
+	gw := &fakeGateway{answer: "grounded answer", sources: sources, groundingAvailable: true}
+	d := NewDispatcher(gw)
+	req := Request{BindingKey: "web:space:S1", Principal: brainapi.Principal{Source: "web", ID: "user-1"}}
+
+	res, err := d.Handle(context.Background(), withText(req, "ask what changed?"))
+	if err != nil {
+		t.Fatalf("ask: %v", err)
+	}
+	if !res.GroundingAvailable {
+		t.Fatalf("expected GroundingAvailable=true, got %+v", res)
+	}
+	if len(res.Sources) != 2 || res.Sources[0].Title != "Doc One" {
+		t.Fatalf("sources = %+v", res.Sources)
+	}
+
+	ungrounded := &fakeGateway{answer: "수집된 근거가 없습니다: q", groundingAvailable: false}
+	res, err = NewDispatcher(ungrounded).Handle(context.Background(), withText(req, "ask unknown?"))
+	if err != nil {
+		t.Fatalf("ask ungrounded: %v", err)
+	}
+	if res.GroundingAvailable || len(res.Sources) != 0 {
+		t.Fatalf("expected no provenance for ungrounded answer, got %+v", res)
+	}
+}
+
+// TestFormatCitations exercises every statement in FormatCitations: the
+// empty-sources short circuit, the title-fallback-to-URI assignment, and the
+// URI-suffix branch.
+func TestFormatCitations(t *testing.T) {
+	t.Parallel()
+	if got := FormatCitations(nil); got != "" {
+		t.Fatalf("empty sources = %q", got)
+	}
+	got := FormatCitations([]brainapi.Source{
+		{Title: "Doc One", URI: "https://example.com/doc1"},
+		{URI: "https://example.com/doc2"},
+	})
+	want := "\n\n출처:\n1. Doc One (https://example.com/doc1)\n2. https://example.com/doc2"
+	if got != want {
+		t.Fatalf("format = %q, want %q", got, want)
+	}
+}
+
 func TestDispatcherCreateAndDiscover(t *testing.T) {
 	t.Parallel()
 	gw := &fakeGateway{}
@@ -250,15 +303,17 @@ func withText(req Request, text string) Request {
 }
 
 type fakeGateway struct {
-	created      gateway.CreateProjectCommand
-	asked        gateway.AskCommand
-	discovered   gateway.DiscoverCommand
-	ingested     gateway.IngestCommand
-	status       gateway.StatusCommand
-	projectState gateway.SetProjectStateCommand
-	answer       string
-	jobStatus    brainapi.JobStatus
-	err          error
+	created            gateway.CreateProjectCommand
+	asked              gateway.AskCommand
+	discovered         gateway.DiscoverCommand
+	ingested           gateway.IngestCommand
+	status             gateway.StatusCommand
+	projectState       gateway.SetProjectStateCommand
+	answer             string
+	sources            []brainapi.Source
+	groundingAvailable bool
+	jobStatus          brainapi.JobStatus
+	err                error
 }
 
 func (f *fakeGateway) CreateProject(_ context.Context, cmd gateway.CreateProjectCommand) (gateway.CreateProjectResult, error) {
@@ -278,7 +333,7 @@ func (f *fakeGateway) Ask(_ context.Context, cmd gateway.AskCommand) (brainapi.Q
 	if answer == "" {
 		answer = "ok"
 	}
-	return brainapi.QueryResponse{Answer: answer}, nil
+	return brainapi.QueryResponse{Answer: answer, Sources: f.sources, GroundingAvailable: f.groundingAvailable}, nil
 }
 
 func (f *fakeGateway) Discover(_ context.Context, cmd gateway.DiscoverCommand) (brainapi.DiscoverResponse, error) {
