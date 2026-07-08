@@ -3,6 +3,7 @@ package jobs
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -108,6 +109,14 @@ func (s *Store) Snapshot(tenantID brainapi.TenantID, jobID brainapi.JobID) (brai
 }
 
 // Reconcile fetches core status and stores it under the same tenant/job scope.
+//
+// If the core has no record of the job (brainapi.KindNotFound — e.g. the
+// worker has not yet driven the job to completion, or the record was never
+// created), Reconcile does not propagate the opaque not-found error to
+// callers. Instead it falls back to reconcileNotFound: an already-final
+// control-plane snapshot is preserved as-is, and a non-final (or missing)
+// snapshot is mapped to [brainapi.JobCheckRequired] so callers can surface a
+// clear "status unconfirmed" signal instead of a bare not-found.
 func (s *Store) Reconcile(ctx context.Context, core CoreStatusReader, tenantID brainapi.TenantID, jobID brainapi.JobID) (brainapi.JobSnapshot, error) {
 	if core == nil {
 		return brainapi.JobSnapshot{}, brainapi.E(brainapi.KindInvalid, "job_reconcile", "core status reader is required", nil)
@@ -117,12 +126,39 @@ func (s *Store) Reconcile(ctx context.Context, core CoreStatusReader, tenantID b
 	}
 	snapshot, err := core.JobStatus(ctx, tenantID, jobID)
 	if err != nil {
+		if brainapi.IsKind(err, brainapi.KindNotFound) {
+			return s.reconcileNotFound(tenantID, jobID, err)
+		}
 		return brainapi.JobSnapshot{}, err
 	}
 	if snapshot.TenantID != tenantID || snapshot.JobID != jobID {
 		return brainapi.JobSnapshot{}, brainapi.E(brainapi.KindInternal, "job_reconcile", "core returned mismatched job scope", nil)
 	}
 	return s.set(snapshot)
+}
+
+// reconcileNotFound handles the core-not-found case for Reconcile.
+//
+//   - If the control-plane already holds a final snapshot (completed/failed),
+//     it is preserved unchanged — a terminal state is never regressed by a
+//     transient or stale core lookup miss.
+//   - Otherwise the job is (re)marked [brainapi.JobCheckRequired] so status
+//     surfaces (e.g. `/brain status`) can tell operators the state could not
+//     be confirmed, rather than leaking a bare not-found error.
+func (s *Store) reconcileNotFound(tenantID brainapi.TenantID, jobID brainapi.JobID, coreErr error) (brainapi.JobSnapshot, error) {
+	s.mu.RLock()
+	existing, ok := s.jobs[jobKey(tenantID, jobID)]
+	s.mu.RUnlock()
+
+	if ok && existing.Status.Final() {
+		return existing, nil
+	}
+
+	message := fmt.Sprintf("core job record not found during reconcile: %v", coreErr)
+	if ok {
+		return s.MarkCheckRequired(tenantID, jobID, message)
+	}
+	return s.set(brainapi.JobSnapshot{TenantID: tenantID, JobID: jobID, Status: brainapi.JobCheckRequired, Error: message})
 }
 
 func (s *Store) set(snapshot brainapi.JobSnapshot) (brainapi.JobSnapshot, error) {
