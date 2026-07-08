@@ -1077,9 +1077,7 @@ func TestCreateSharedTenantValidation(t *testing.T) {
 	t.Run("persist failure rolls back", func(t *testing.T) {
 		t.Parallel()
 		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-rollback", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
 		if !brainapi.IsKind(err, brainapi.KindInternal) {
@@ -1180,9 +1178,7 @@ func TestBindSharedTenantValidation(t *testing.T) {
 			t.Fatalf("CreateSharedTenant: %v", err)
 		}
 
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "bst-rb-project", SharedTenantID: "bst-rb-shared"})
 		if !brainapi.IsKind(err, brainapi.KindInternal) {
@@ -1348,9 +1344,7 @@ func TestPromoteSourceValidation(t *testing.T) {
 			t.Fatalf("Ingest: %v", err)
 		}
 
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.PromoteSource(ctx, brainapi.PromoteRequest{
 			Admin: admin, ProjectTenantID: "ps-rb-project", SharedTenantID: "ps-rb-shared", SourceID: "ps-rb-project:source:0",

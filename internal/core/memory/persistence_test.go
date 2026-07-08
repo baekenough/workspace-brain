@@ -151,18 +151,15 @@ func TestPersistentCoreWrapsWriteErrors(t *testing.T) {
 
 // TestMutationRollsBackOnPersistFailure verifies that Ingest, CompleteJob, and
 // SetProjectState roll back their in-memory writes atomically when persistLocked fails.
-// marshalSnapshot is injected to trigger a deterministic persist failure without
-// touching the filesystem.
+// marshalSnapshotFn is injected on each test's own Core instance to trigger a
+// deterministic persist failure without touching the filesystem.
 func TestMutationRollsBackOnPersistFailure(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("ingest", func(t *testing.T) {
 		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
 		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
-
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "file://a"}})
 		if !brainapi.IsKind(err, brainapi.KindInternal) {
@@ -179,10 +176,7 @@ func TestMutationRollsBackOnPersistFailure(t *testing.T) {
 		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
 		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
 		core.jobs[jobKey("tenant-a", "job-1")] = brainapi.JobSnapshot{TenantID: "tenant-a", JobID: "job-1", Status: brainapi.JobRunning}
-
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.CompleteJob("tenant-a", "job-1", brainapi.JobCompleted, "result://1", "")
 		if !brainapi.IsKind(err, brainapi.KindInternal) {
@@ -201,10 +195,7 @@ func TestMutationRollsBackOnPersistFailure(t *testing.T) {
 	t.Run("set_project_state", func(t *testing.T) {
 		core := newCore(WithPersistence(filepath.Join(t.TempDir(), "m.json")))
 		core.projects[brainapi.TenantID("tenant-a")] = project{owner: brainapi.Principal{ID: "owner"}, state: brainapi.ProjectOn}
-
-		orig := marshalSnapshot
-		marshalSnapshot = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
-		t.Cleanup(func() { marshalSnapshot = orig })
+		core.marshalSnapshotFn = func(_ snapshot) ([]byte, error) { return nil, errors.New("encode failed") }
 
 		err := core.SetProjectState(ctx, "tenant-a", brainapi.ProjectOff)
 		if !brainapi.IsKind(err, brainapi.KindInternal) {
@@ -219,13 +210,10 @@ func TestMutationRollsBackOnPersistFailure(t *testing.T) {
 }
 
 func TestPersistentCoreWrapsMarshalErrors(t *testing.T) {
-	original := marshalSnapshot
-	marshalSnapshot = func(snapshot) ([]byte, error) {
+	core := newCore(WithPersistence(filepath.Join(t.TempDir(), "memory.json")))
+	core.marshalSnapshotFn = func(snapshot) ([]byte, error) {
 		return nil, errors.New("encode failed")
 	}
-	t.Cleanup(func() { marshalSnapshot = original })
-
-	core := newCore(WithPersistence(filepath.Join(t.TempDir(), "memory.json")))
 	err := core.CreateProject(context.Background(), brainapi.CreateProjectRequest{TenantID: "tenant-a", BindingKey: "api:space:A", OwnerPrincipal: brainapi.Principal{ID: "owner"}})
 	if !brainapi.IsKind(err, brainapi.KindInternal) {
 		t.Fatalf("marshal error kind=%q err=%v", brainapi.KindOf(err), err)
@@ -305,7 +293,7 @@ func TestAtomicWriteFileReturnsCreateTempAndRenameErrors(t *testing.T) {
 			t.Fatalf("Mkdir readonly: %v", err)
 		}
 		defer func() { _ = os.Chmod(dir, 0o700) }()
-		err := atomicWriteFile(filepath.Join(dir, "memory.json"), []byte("{}"), 0o600)
+		err := atomicWriteFile(filepath.Join(dir, "memory.json"), []byte("{}"), 0o600, defaultCreateAtomicTemp, os.Rename)
 		if err == nil {
 			t.Fatalf("atomicWriteFile in readonly dir succeeded, want CreateTemp error")
 		}
@@ -316,7 +304,7 @@ func TestAtomicWriteFileReturnsCreateTempAndRenameErrors(t *testing.T) {
 		if err := os.Mkdir(targetDir, 0o755); err != nil {
 			t.Fatalf("Mkdir target directory: %v", err)
 		}
-		err := atomicWriteFile(targetDir, []byte("{}"), 0o600)
+		err := atomicWriteFile(targetDir, []byte("{}"), 0o600, defaultCreateAtomicTemp, os.Rename)
 		if err == nil {
 			t.Fatalf("atomicWriteFile over directory succeeded, want Rename error")
 		}
@@ -348,14 +336,12 @@ func TestAtomicWriteFileReturnsInjectedFileOperationErrors(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			originalCreate := createAtomicTemp
-			createAtomicTemp = func(dir, pattern string) (atomicTempFile, error) {
+			createTemp := func(dir, pattern string) (atomicTempFile, error) {
 				tt.file.name = filepath.Join(dir, "."+tt.name+".tmp")
 				return tt.file, nil
 			}
-			t.Cleanup(func() { createAtomicTemp = originalCreate })
 
-			err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600)
+			err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600, createTemp, os.Rename)
 			if err == nil {
 				t.Fatalf("atomicWriteFile succeeded, want %s error", tt.name)
 			}
@@ -365,26 +351,22 @@ func TestAtomicWriteFileReturnsInjectedFileOperationErrors(t *testing.T) {
 
 func TestAtomicWriteFileReturnsInjectedCreateTempAndRenameErrors(t *testing.T) {
 	t.Run("create temp", func(t *testing.T) {
-		originalCreate := createAtomicTemp
-		createAtomicTemp = func(dir, pattern string) (atomicTempFile, error) {
+		createTemp := func(dir, pattern string) (atomicTempFile, error) {
 			return nil, errors.New("create temp failed")
 		}
-		t.Cleanup(func() { createAtomicTemp = originalCreate })
 
-		err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600)
+		err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600, createTemp, os.Rename)
 		if err == nil {
 			t.Fatalf("atomicWriteFile succeeded, want create temp error")
 		}
 	})
 
 	t.Run("rename", func(t *testing.T) {
-		originalRename := renameAtomicFile
-		renameAtomicFile = func(oldpath, newpath string) error {
+		renameFile := func(oldpath, newpath string) error {
 			return errors.New("rename failed")
 		}
-		t.Cleanup(func() { renameAtomicFile = originalRename })
 
-		err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600)
+		err := atomicWriteFile(filepath.Join(t.TempDir(), "memory.json"), []byte("{}"), 0o600, defaultCreateAtomicTemp, renameFile)
 		if err == nil {
 			t.Fatalf("atomicWriteFile succeeded, want rename error")
 		}

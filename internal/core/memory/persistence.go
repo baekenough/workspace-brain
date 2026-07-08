@@ -101,11 +101,11 @@ func (c *Core) persistLocked() error {
 	if c.persistencePath == "" {
 		return nil
 	}
-	data, err := marshalSnapshot(c.snapshotLocked())
+	data, err := c.marshalSnapshotFn(c.snapshotLocked())
 	if err != nil {
 		return brainapi.E(brainapi.KindInternal, "persist_snapshot", "encode memory snapshot", err)
 	}
-	if err := atomicWriteFile(c.persistencePath, data, 0o600); err != nil {
+	if err := atomicWriteFile(c.persistencePath, data, 0o600, c.createAtomicTempFn, c.renameAtomicFileFn); err != nil {
 		return brainapi.E(brainapi.KindInternal, "persist_snapshot", "write memory snapshot", err)
 	}
 	return nil
@@ -146,22 +146,33 @@ type atomicTempFile interface {
 	Close() error
 }
 
-var (
-	marshalSnapshot = func(snap snapshot) ([]byte, error) {
-		return json.MarshalIndent(snap, "", "  ")
-	}
-	createAtomicTemp = func(dir, pattern string) (atomicTempFile, error) {
-		return os.CreateTemp(dir, pattern)
-	}
-	renameAtomicFile = os.Rename
-)
+// defaultMarshalSnapshot, defaultCreateAtomicTemp, and os.Rename are the
+// production implementations of the three persistence seams below. They are
+// plain functions (not package-level vars) precisely so that fault-injecting
+// tests cannot mutate shared package state: every Core instance holds its own
+// copy of these seams as struct fields (see newCore), so parallel tests that
+// inject a failing implementation on one Core can never race with, or leak
+// into, another Core running concurrently in the same test binary.
+func defaultMarshalSnapshot(snap snapshot) ([]byte, error) {
+	return json.MarshalIndent(snap, "", "  ")
+}
 
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+func defaultCreateAtomicTemp(dir, pattern string) (atomicTempFile, error) {
+	return os.CreateTemp(dir, pattern)
+}
+
+func atomicWriteFile(
+	path string,
+	data []byte,
+	perm os.FileMode,
+	createTemp func(dir, pattern string) (atomicTempFile, error),
+	renameFile func(oldpath, newpath string) error,
+) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := createAtomicTemp(dir, "."+filepath.Base(path)+"-*.tmp")
+	tmp, err := createTemp(dir, "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -182,7 +193,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := renameAtomicFile(tmpName, path); err != nil {
+	if err := renameFile(tmpName, path); err != nil {
 		return err
 	}
 	return syncDir(dir)

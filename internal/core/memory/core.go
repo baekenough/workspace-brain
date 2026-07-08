@@ -4,6 +4,7 @@ package memory
 import (
 	"context"
 	"math"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -234,6 +235,18 @@ type Core struct {
 	// project tenants appear as keys; shared tenants never bind other shared
 	// tenants.
 	sharedBindings map[brainapi.TenantID][]brainapi.TenantID
+
+	// ─── Persistence seams (see persistence.go) ─────────────────────────────
+	//
+	// These are per-instance function fields, not package-level vars: fault
+	// injection tests overwrite them on a single Core value (e.g.
+	// core.marshalSnapshotFn = ...), so parallel tests that each construct
+	// their own Core can inject independent failures without any shared
+	// mutable state and therefore without any possibility of a data race
+	// between concurrently running tests.
+	marshalSnapshotFn  func(snapshot) ([]byte, error)
+	createAtomicTempFn func(dir, pattern string) (atomicTempFile, error)
+	renameAtomicFileFn func(oldpath, newpath string) error
 }
 
 type project struct {
@@ -372,18 +385,21 @@ func NewPersistent(path string, opts ...Option) (*Core, error) {
 
 func newCore(opts ...Option) *Core {
 	c := &Core{
-		now:            time.Now,
-		embedder:       localEmbedder{},
-		vectorStore:    newInMemoryVectorStore(),
-		synthesizer:    localSynthesizer{},
-		reranker:       localReranker{},
-		topN:           3,
-		bindings:       make(map[brainapi.BindingKey]brainapi.TenantID),
-		projects:       make(map[brainapi.TenantID]project),
-		jobs:           make(map[string]brainapi.JobSnapshot),
-		sources:        make(map[brainapi.TenantID][]brainapi.SourceRef),
-		docs:           make(map[brainapi.TenantID][]document),
-		sharedBindings: make(map[brainapi.TenantID][]brainapi.TenantID),
+		now:                time.Now,
+		embedder:           localEmbedder{},
+		vectorStore:        newInMemoryVectorStore(),
+		synthesizer:        localSynthesizer{},
+		reranker:           localReranker{},
+		topN:               3,
+		bindings:           make(map[brainapi.BindingKey]brainapi.TenantID),
+		projects:           make(map[brainapi.TenantID]project),
+		jobs:               make(map[string]brainapi.JobSnapshot),
+		sources:            make(map[brainapi.TenantID][]brainapi.SourceRef),
+		docs:               make(map[brainapi.TenantID][]document),
+		sharedBindings:     make(map[brainapi.TenantID][]brainapi.TenantID),
+		marshalSnapshotFn:  defaultMarshalSnapshot,
+		createAtomicTempFn: defaultCreateAtomicTemp,
+		renameAtomicFileFn: os.Rename,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -607,6 +623,22 @@ func (c *Core) Query(ctx context.Context, req brainapi.QueryRequest) (brainapi.Q
 			continue
 		}
 		top = append(top, candidates[idx])
+	}
+
+	// Determine each source's Tier here rather than trusting whatever the
+	// VectorStore returned on Chunk.Source.Tier: TierProject for chunks owned
+	// by req.TenantID itself, TierShared for chunks contributed by a bound
+	// shared tenant (see brainapi.Tier and SharedKnowledgeCore.PromoteSource).
+	// This mirrors the postgres core's tier derivation (internal/core/postgres
+	// Query) and makes Tier semantics identical across every VectorStore
+	// implementation, including ones (e.g. qdrant) whose payload encoding does
+	// not round-trip the Tier field.
+	for i := range top {
+		if top[i].Source.TenantID == req.TenantID {
+			top[i].Source.Tier = brainapi.TierProject
+		} else {
+			top[i].Source.Tier = brainapi.TierShared
+		}
 	}
 
 	// Synthesize the grounded answer.
