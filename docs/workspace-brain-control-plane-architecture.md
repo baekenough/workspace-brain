@@ -123,7 +123,7 @@ sequenceDiagram
     A-->>U: rendered response
 ```
 
-`create`는 admin 권한이 필요하다. gateway는 `crypto/rand`를 이용해 `tenant-<32-hex-chars>` 형식의 무작위 ID를 생성한다.
+`create`는 admin 권한이 필요하다(현재 실행 바이너리가 사용하는 `RoleAuthorizer` 기준). 결정된 생성 권한 정책(admin 또는 create allowlist)과 현재 배선 상태는 §5 "Auth and tenant isolation"을 참조. gateway는 `crypto/rand`를 이용해 `tenant-<32-hex-chars>` 형식의 무작위 ID를 생성한다.
 
 ### 4.2 Ingest
 
@@ -199,13 +199,15 @@ sequenceDiagram
 
 - Adapter authentication은 요청 출처를 검증한다.
 - Gateway authorization은 `Principal`, `Action`, `TenantID`/`BindingKey` 조합을 검증한다.
-- 현재 `RoleAuthorizer`는 `admin`에게 모든 권한을 주고, `member`에게 기존 tenant read/write 작업을 허용한다.
-- `create_project`와 `admin` action은 `admin` role이 필요하다.
+- 현재 실행 바이너리(`cmd/workspace-brain/main.go`)는 `RoleAuthorizer`를 사용한다. `RoleAuthorizer`는 `admin`에게 모든 권한을 주고, `member`에게 기존 tenant read/write 작업을 허용한다.
+- `create_project`와 `admin` action은 `admin` role이 필요하다(`RoleAuthorizer` 기준).
 - `ResolveBinding(binding_key)`만 surface binding을 tenant로 바꾸는 preflight 예외다.
 - Gateway는 not found와 unauthorized를 `SafeAccessError`로 통합한다.
 - Job 상태는 항상 `(tenant_id, job_id)` scope로 저장·조회한다.
 
-Production extension: role 정책, membership refresh, audit log, tenant allowlist는 같은 gateway seam 뒤에서 강화한다.
+**생성 권한 정책 (결정됨, G7)**: `create_project`는 (1) `admin` role 또는 (2) `CREATE_ALLOW_USERS` 환경변수로 구성하는 create allowlist에 등록된 principal만 실행할 수 있다. 이 정책은 `internal/control/gateway/authorizer.go`의 `PolicyAuthorizer`에 구현되어 있으며, allowlist는 admin 없이 project 생성만 허용하는 opt-in 확장이다. `create_project`/`admin`은 `isSensitiveAction`으로 분류되어 `CachingAuthorizer`의 TTL 캐시를 우회하고 항상 live 재검증된다. 상세 운영 방법(env var 형식, allowlist 매칭 규칙)은 `docs/operations.md`의 "생성 권한 정책" 섹션 참조.
+
+**⚠️ 알려진 배선 갭**: `PolicyAuthorizer`와 `Config.CreateAllowlistSet()`/`CREATE_ALLOW_USERS`는 구현·테스트는 완료되었으나 `cmd/workspace-brain/main.go`는 여전히 `gateway.RoleAuthorizer{}`를 사용한다. 따라서 위 결정된 정책은 현재 실행 중인 서버에는 적용되지 않으며, `CREATE_ALLOW_USERS`를 설정해도 효과가 없다. `RoleAuthorizer`를 `gateway.NewPolicyAuthorizer(cfg.CreateAllowlistSet())`로 교체하는 배선 작업이 별도로 필요하다(코드 변경이므로 이 문서화 작업 범위 밖).
 
 ---
 
