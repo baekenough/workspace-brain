@@ -40,7 +40,7 @@ flowchart TB
     GW --> Jobs
     GW --> Loader
     GW --> Local
-    GW -. same brainapi.Core contract .-> Prod
+    GW -.->|same brainapi.Core contract| Prod
 ```
 
 | Layer | Current implementation | Responsibility |
