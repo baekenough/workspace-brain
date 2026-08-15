@@ -20,12 +20,27 @@ type snapshot struct {
 	Jobs     map[string]brainapi.JobSnapshot            `json:"jobs"`
 	Sources  map[brainapi.TenantID][]brainapi.SourceRef `json:"sources"`
 	Docs     map[brainapi.TenantID][]documentSnapshot   `json:"docs"`
+	// SharedBindings maps a project tenant ID to the shared tenant IDs bound
+	// to it (see Core.sharedBindings). Absent from snapshots written before
+	// #21, in which case it decodes as nil and every project tenant loads
+	// with no bindings.
+	SharedBindings map[brainapi.TenantID][]brainapi.TenantID `json:"shared_bindings,omitempty"`
 }
 
 type projectSnapshot struct {
 	Owner    brainapi.Principal    `json:"owner"`
 	Metadata map[string]string     `json:"metadata,omitempty"`
 	State    brainapi.ProjectState `json:"state"`
+	// Tier is absent from snapshots written before #21, in which case it
+	// decodes as the zero value (""); loadSnapshot normalizes that to
+	// brainapi.TierProject so pre-existing snapshots keep loading their
+	// tenants as ordinary project tenants.
+	Tier brainapi.Tier `json:"tier,omitempty"`
+	// CreatedAt is absent from snapshots written before #21, in which case
+	// it decodes as the zero time.Time. This only affects the CreatedAt
+	// field reported by AdminListTenants for tenants provisioned before the
+	// fix; it has no effect on tenant behavior.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type documentSnapshot struct {
@@ -60,7 +75,11 @@ func (c *Core) loadSnapshot() error {
 	}
 	projects := make(map[brainapi.TenantID]project, len(snap.Projects))
 	for tenantID, proj := range snap.Projects {
-		projects[tenantID] = project{owner: proj.Owner, metadata: cloneMap(proj.Metadata), state: proj.State}
+		tier := proj.Tier
+		if tier == "" {
+			tier = brainapi.TierProject
+		}
+		projects[tenantID] = project{owner: proj.Owner, metadata: cloneMap(proj.Metadata), state: proj.State, createdAt: proj.CreatedAt, tier: tier}
 	}
 	jobs := make(map[string]brainapi.JobSnapshot, len(snap.Jobs))
 	for key, job := range snap.Jobs {
@@ -69,6 +88,10 @@ func (c *Core) loadSnapshot() error {
 	sources := make(map[brainapi.TenantID][]brainapi.SourceRef, len(snap.Sources))
 	for tenantID, refs := range snap.Sources {
 		sources[tenantID] = append([]brainapi.SourceRef(nil), refs...)
+	}
+	sharedBindings := make(map[brainapi.TenantID][]brainapi.TenantID, len(snap.SharedBindings))
+	for tenantID, bound := range snap.SharedBindings {
+		sharedBindings[tenantID] = append([]brainapi.TenantID(nil), bound...)
 	}
 	docs := make(map[brainapi.TenantID][]document, len(snap.Docs))
 	// chunks is built locally then pushed to c.vectorStore so the VectorStore
@@ -88,6 +111,7 @@ func (c *Core) loadSnapshot() error {
 	c.jobs = jobs
 	c.sources = sources
 	c.docs = docs
+	c.sharedBindings = sharedBindings
 	for tenantID, chunks := range chunksByTenant {
 		c.vectorStore.Replace(tenantID, chunks)
 	}
@@ -118,7 +142,7 @@ func (c *Core) snapshotLocked() snapshot {
 	}
 	projects := make(map[brainapi.TenantID]projectSnapshot, len(c.projects))
 	for tenantID, proj := range c.projects {
-		projects[tenantID] = projectSnapshot{Owner: proj.owner, Metadata: cloneMap(proj.metadata), State: proj.state}
+		projects[tenantID] = projectSnapshot{Owner: proj.owner, Metadata: cloneMap(proj.metadata), State: proj.state, Tier: proj.tier, CreatedAt: proj.createdAt}
 	}
 	jobs := make(map[string]brainapi.JobSnapshot, len(c.jobs))
 	for key, job := range c.jobs {
@@ -135,7 +159,11 @@ func (c *Core) snapshotLocked() snapshot {
 			docs[tenantID] = append(docs[tenantID], documentSnapshot{Source: doc.source, Title: doc.title, Content: doc.content, FreshAt: doc.freshAt})
 		}
 	}
-	return snapshot{Version: snapshotVersion, Bindings: bindings, Projects: projects, Jobs: jobs, Sources: sources, Docs: docs}
+	sharedBindings := make(map[brainapi.TenantID][]brainapi.TenantID, len(c.sharedBindings))
+	for tenantID, bound := range c.sharedBindings {
+		sharedBindings[tenantID] = append([]brainapi.TenantID(nil), bound...)
+	}
+	return snapshot{Version: snapshotVersion, Bindings: bindings, Projects: projects, Jobs: jobs, Sources: sources, Docs: docs, SharedBindings: sharedBindings}
 }
 
 type atomicTempFile interface {

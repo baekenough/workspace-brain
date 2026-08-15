@@ -67,6 +67,148 @@ func TestPersistentCoreLoadsExistingSnapshot(t *testing.T) {
 	}
 }
 
+// TestPersistentCoreSharedTenantAndBindingsSurvivesReload is a regression test
+// for #21: a shared knowledge tenant's tier and its binding to a project
+// tenant must round-trip through a NewPersistent reload, not just its raw
+// project/binding/job/source/doc state.
+func TestPersistentCoreSharedTenantAndBindingsSurvivesReload(t *testing.T) {
+	fixed := time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "memory.json")
+	ctx := context.Background()
+
+	core, err := NewPersistent(path, WithClock(func() time.Time { return fixed }))
+	if err != nil {
+		t.Fatalf("NewPersistent: %v", err)
+	}
+	mustCreate(t, core, "tenant-a", "api:space:A")
+	if err := core.CreateSharedTenant(ctx, brainapi.CreateSharedTenantRequest{TenantID: "shared-a", OwnerPrincipal: brainapi.Principal{ID: "owner"}}); err != nil {
+		t.Fatalf("CreateSharedTenant: %v", err)
+	}
+	if err := core.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "tenant-a", SharedTenantID: "shared-a"}); err != nil {
+		t.Fatalf("BindSharedTenant: %v", err)
+	}
+	if err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "text://a", Name: "alpha", MimeType: "text/plain"}, Metadata: map[string]string{"content": "shared alpha content"}}); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+	if err := core.PromoteSource(ctx, brainapi.PromoteRequest{Admin: brainapi.Principal{ID: "admin", Roles: []string{"admin"}}, ProjectTenantID: "tenant-a", SharedTenantID: "shared-a", SourceID: "tenant-a:source:0"}); err != nil {
+		t.Fatalf("PromoteSource: %v", err)
+	}
+
+	loaded, err := NewPersistent(path)
+	if err != nil {
+		t.Fatalf("reload NewPersistent: %v", err)
+	}
+
+	// tier survived: Ingest directly into shared-a must still be rejected.
+	// If tier had been lost on reload, shared-a would decode as a project
+	// tenant and this Ingest would succeed instead.
+	err = loaded.Ingest(ctx, brainapi.IngestRequest{TenantID: "shared-a", JobID: "job-2", Source: brainapi.SourceRef{URI: "text://b"}})
+	if !brainapi.IsKind(err, brainapi.KindUnauthorized) {
+		t.Fatalf("Ingest into reloaded shared tenant kind=%q err=%v, want KindUnauthorized (tier not preserved)", brainapi.KindOf(err), err)
+	}
+
+	// binding survived: SharedBindings must still report shared-a.
+	bound, err := loaded.SharedBindings(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("SharedBindings after reload: %v", err)
+	}
+	if len(bound) != 1 || bound[0] != "shared-a" {
+		t.Fatalf("SharedBindings after reload = %v, want [shared-a]", bound)
+	}
+
+	// binding survived (independent check): re-binding the same pair must
+	// fail with AlreadyExists rather than silently succeeding.
+	err = loaded.BindSharedTenant(ctx, brainapi.BindSharedTenantRequest{ProjectTenantID: "tenant-a", SharedTenantID: "shared-a"})
+	if !brainapi.IsKind(err, brainapi.KindAlreadyExists) {
+		t.Fatalf("re-bind after reload kind=%q err=%v, want KindAlreadyExists", brainapi.KindOf(err), err)
+	}
+
+	// Query scope survived: the promoted content in shared-a must still be
+	// reachable through a Query scoped to tenant-a.
+	answer, err := loaded.Query(ctx, brainapi.QueryRequest{TenantID: "tenant-a", Question: "shared alpha"})
+	if err != nil {
+		t.Fatalf("Query after reload: %v", err)
+	}
+	if !answer.GroundingAvailable || !strings.Contains(answer.Answer, "shared alpha") {
+		t.Fatalf("promoted shared content missing after reload: %+v", answer)
+	}
+
+	// createdAt survived: AdminListTenants must report the original creation
+	// time for shared-a, not the zero value.
+	tenants, err := loaded.AdminListTenants(ctx, brainapi.AdminListTenantsRequest{})
+	if err != nil {
+		t.Fatalf("AdminListTenants after reload: %v", err)
+	}
+	found := false
+	for _, tenant := range tenants.Tenants {
+		if tenant.TenantID != "shared-a" {
+			continue
+		}
+		found = true
+		if !tenant.CreatedAt.Equal(fixed) {
+			t.Fatalf("shared-a CreatedAt after reload = %v, want %v", tenant.CreatedAt, fixed)
+		}
+	}
+	if !found {
+		t.Fatalf("shared-a missing from AdminListTenants after reload: %+v", tenants.Tenants)
+	}
+}
+
+// TestLoadSnapshotLegacySnapshotWithoutTierOrSharedBindings is a regression
+// test for #21: a hand-written snapshot from before tier/shared_bindings
+// existed (no "tier" field on projects, no top-level "shared_bindings" key)
+// must still load successfully, with every tenant treated as an ordinary
+// project tenant with no shared bindings.
+func TestLoadSnapshotLegacySnapshotWithoutTierOrSharedBindings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.json")
+	legacy := `{
+		"version": 1,
+		"bindings": {"api:space:A": "tenant-a"},
+		"projects": {
+			"tenant-a": {
+				"owner": {"id": "owner"},
+				"state": "on"
+			}
+		},
+		"jobs": {},
+		"sources": {},
+		"docs": {}
+	}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("WriteFile legacy snapshot: %v", err)
+	}
+
+	ctx := context.Background()
+	core, err := NewPersistent(path)
+	if err != nil {
+		t.Fatalf("NewPersistent legacy snapshot: %v", err)
+	}
+
+	tenantID, err := core.ResolveBinding(ctx, "api:space:A")
+	if err != nil {
+		t.Fatalf("ResolveBinding: %v", err)
+	}
+	if tenantID != "tenant-a" {
+		t.Fatalf("tenantID = %q, want tenant-a", tenantID)
+	}
+
+	// A missing tier must default to project: ordinary Ingest must succeed
+	// (it would fail with KindUnauthorized if tenant-a were mistakenly
+	// treated as a shared tenant).
+	if err := core.Ingest(ctx, brainapi.IngestRequest{TenantID: "tenant-a", JobID: "job-1", Source: brainapi.SourceRef{URI: "text://legacy"}}); err != nil {
+		t.Fatalf("Ingest into legacy-loaded project tenant: %v", err)
+	}
+
+	// A missing shared_bindings key must decode as no bindings.
+	bound, err := core.SharedBindings(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("SharedBindings on legacy-loaded tenant: %v", err)
+	}
+	if len(bound) != 0 {
+		t.Fatalf("SharedBindings on legacy-loaded tenant = %v, want empty", bound)
+	}
+}
+
 func TestPersistentCoreMutationPersists(t *testing.T) {
 	fixed := time.Date(2026, 6, 25, 4, 5, 6, 0, time.UTC)
 	path := filepath.Join(t.TempDir(), "memory.json")
