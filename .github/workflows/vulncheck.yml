@@ -1,0 +1,33 @@
+name: vulncheck
+
+on:
+  pull_request:
+  schedule:
+    # Daily at 06:00 UTC. govulncheck queries a remote vulnerability
+    # database, so this workflow can turn red with no code change at all.
+    # Running it on a schedule means main's status is discovered here
+    # rather than by whoever happens to open the next PR (see #25).
+    #
+    # Note: GitHub disables scheduled workflows after 60 days of repository
+    # inactivity. If this repo goes quiet, re-enable it in the Actions tab.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: govulncheck
+        # Pin to a specific release for reproducible CI; bump this tag
+        # deliberately when upgrading (do not revert to @latest).
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...

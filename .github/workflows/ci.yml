@@ -4,6 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly on Monday at 06:30 UTC. Without this, main is only ever
+    # verified when someone pushes or opens a PR, so breakage caused by
+    # external drift (action updates, base image changes, toolchain
+    # downloads) stays invisible until it blocks somebody (see #25).
+    # Vulnerability scanning runs daily in vulncheck.yml instead.
+    #
+    # Note: GitHub disables scheduled workflows after 60 days of repository
+    # inactivity. If this repo goes quiet, re-enable it in the Actions tab.
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   test:
@@ -29,12 +40,6 @@ jobs:
       - run: ./scripts/check-coverage.sh coverage.out
       - name: docker build
         run: make docker-build
-      - name: govulncheck
-        # Pin to a specific release for reproducible CI; bump this tag
-        # deliberately when upgrading (do not revert to @latest).
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          govulncheck ./...
 
   integration-test:
     name: integration test (postgres, qdrant, rabbitmq adapters)
