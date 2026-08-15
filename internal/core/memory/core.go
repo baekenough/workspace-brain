@@ -262,9 +262,12 @@ type project struct {
 }
 
 // isShared reports whether p is a shared knowledge tenant. The zero value of
-// tier ("") is deliberately treated as a project tenant so that snapshots
-// persisted before the tier field existed keep behaving as project tenants
-// after reload (see persistence.go, which does not yet round-trip tier).
+// tier ("") is treated as a project tenant. persistence.go round-trips tier
+// through the snapshot and explicitly normalizes a missing/empty tier to
+// brainapi.TierProject on load (see loadSnapshot), so this zero-value
+// fallback here is now purely defensive: it only matters for project values
+// built without going through CreateProject/CreateSharedTenant, such as
+// hand-constructed test fixtures.
 func (p project) isShared() bool {
 	return p.tier == brainapi.TierShared
 }
